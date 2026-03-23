@@ -58,7 +58,6 @@ database:
 generate:
   client:
     runtime: go
-    schema: schemas/schema.fga  # overrides top-level schema
     output: internal/authz
     package: authz
     filter: can_
@@ -152,7 +151,6 @@ When using discrete fields, `host`, `name`, and `user` are required.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `runtime` | string | — | Target runtime: `go`, `typescript` |
-| `schema` | string | (top-level `schema`) | Path to schema file |
 | `output` | string | — | Output directory for generated code |
 | `package` | string | `authz` | Package/module name |
 | `filter` | string | — | Relation prefix filter (e.g., `can_`) |
@@ -201,7 +199,6 @@ All config options are available as environment variables using the `MELANGE_` p
 | `MELANGE_DATABASE_PASSWORD` | `database.password` |
 | `MELANGE_DATABASE_SSLMODE` | `database.sslmode` |
 | `MELANGE_GENERATE_CLIENT_RUNTIME` | `generate.client.runtime` |
-| `MELANGE_GENERATE_CLIENT_SCHEMA` | `generate.client.schema` |
 | `MELANGE_GENERATE_CLIENT_OUTPUT` | `generate.client.output` |
 | `MELANGE_GENERATE_CLIENT_PACKAGE` | `generate.client.package` |
 | `MELANGE_GENERATE_CLIENT_FILTER` | `generate.client.filter` |
@@ -215,22 +212,6 @@ All config options are available as environment variables using the `MELANGE_` p
 | `MELANGE_DOCTOR_SKIP_PERFORMANCE` | `doctor.skip_performance` |
 
 Boolean environment variables accept `true`/`false` or `1`/`0`.
-
----
-
-## Configuration inheritance
-
-Per-command settings override the top-level defaults:
-
-```yaml
-# Top-level default
-schema: schemas/schema.fga
-
-generate:
-  client:
-    # Overrides top-level schema for generate only
-    schema: schemas/api-schema.fga
-```
 
 ---
 
