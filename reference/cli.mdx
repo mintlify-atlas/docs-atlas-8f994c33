@@ -1,0 +1,700 @@
+---
+title: "CLI reference"
+description: "Complete reference for all Melange CLI commands, flags, and exit codes."
+---
+
+The Melange CLI compiles OpenFGA schemas into PostgreSQL functions, validates schemas, and generates client code. It is built on Cobra/Viper and supports configuration files, environment variables, and command-line flags with consistent precedence.
+
+## Installation
+
+```bash
+go install github.com/pthm/melange/cmd/melange@latest
+```
+
+## Global flags
+
+These flags are available on every command.
+
+| Flag | Description |
+|------|-------------|
+| `--config` | Path to config file (default: auto-discover `melange.yaml`) |
+| `-v`, `--verbose` | Increase verbosity. Repeat for more detail: `-vv`, `-vvv` |
+| `-q`, `--quiet` | Suppress all non-error output |
+| `--no-update-check` | Disable the background version check |
+
+### Update notifications
+
+By default, Melange checks for new versions in the background and shows a notice after each command completes:
+
+```
+$ melange migrate
+Migration completed successfully
+
+* A new version of melange is available: v1.2.3 (current: v1.2.0)
+  brew upgrade melange  or  go install github.com/pthm/melange/cmd/melange@latest
+```
+
+The check runs in a goroutine with a 5-second timeout, caches results for 24 hours in `~/.cache/melange/update-check.json`, and is automatically disabled in CI environments (when the `CI` environment variable is set).
+
+To disable permanently:
+
+```bash
+melange --no-update-check migrate
+```
+
+To clear the cache:
+
+```bash
+rm -f ~/.cache/melange/update-check.json
+```
+
+The cache directory respects the `XDG_CACHE_HOME` environment variable.
+
+---
+
+## Schema commands
+
+<AccordionGroup>
+  <Accordion title="validate — check schema syntax">
+
+    Parse and validate your `.fga` schema file without touching the database.
+
+    ```bash
+    melange validate --schema schemas/schema.fga
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--schema` | `schemas/schema.fga` | Path to the schema file |
+
+    **Example output**
+
+    ```
+    Schema is valid. Found 3 types:
+      - user (0 relations)
+      - organization (3 relations)
+      - repository (5 relations)
+    ```
+
+  </Accordion>
+
+  <Accordion title="migrate — apply schema to PostgreSQL">
+
+    Compile your schema and install the generated SQL functions into PostgreSQL.
+
+    ```bash
+    melange migrate \
+      --db postgres://localhost/mydb \
+      --schema schemas/schema.fga
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--db` | (from config) | PostgreSQL connection string |
+    | `--schema` | `schemas/schema.fga` | Path to the schema file |
+    | `--dry-run` | `false` | Print the SQL to stdout without applying it |
+    | `--force` | `false` | Force re-migration even when the schema is unchanged |
+
+    **What it does**
+
+    1. Checks whether the schema has changed since the last migration (SHA256 checksum)
+    2. Installs generated SQL functions (`check_permission`, `list_accessible_objects`, etc.)
+    3. Drops orphaned functions from relations removed from the schema
+    4. Records the migration in the `melange_migrations` tracking table
+
+    **Skip-if-unchanged**
+
+    When the schema checksum matches the last recorded migration, the command exits early:
+
+    ```
+    Schema unchanged, migration skipped.
+    Use --force to re-apply.
+    ```
+
+    Use `--force` to re-apply regardless — useful after upgrading Melange itself.
+
+    **Dry-run mode**
+
+    Preview all SQL that would be executed without touching the database:
+
+    ```bash
+    melange migrate --db postgres://localhost/mydb --dry-run > migration.sql
+    ```
+
+    The output includes DDL for the tracking table, all generated functions, dispatcher functions, and the migration record insert.
+
+    <Warning>
+    After migration, if the `melange_tuples` view doesn't exist yet you will see:
+    ```
+    WARNING: melange_tuples view/table does not exist.
+             Permission checks will fail until you create it.
+    ```
+    See the tuples view concepts page for setup instructions.
+    </Warning>
+
+  </Accordion>
+
+  <Accordion title="status — check migration status">
+
+    Show whether the schema file and tuples view are present.
+
+    ```bash
+    melange status \
+      --db postgres://localhost/mydb \
+      --schema schemas/schema.fga
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--db` | (from config) | PostgreSQL connection string |
+    | `--schema` | `schemas/schema.fga` | Path to the schema file |
+
+    **Example output**
+
+    ```
+    Schema file:  present
+    Tuples view:  present
+    ```
+
+  </Accordion>
+
+  <Accordion title="doctor — run health checks">
+
+    Run comprehensive health checks across your entire authorization stack.
+
+    ```bash
+    melange doctor \
+      --db postgres://localhost/mydb \
+      --schema schemas/schema.fga
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--db` | (from config) | PostgreSQL connection string |
+    | `--schema` | `schemas/schema.fga` | Path to the schema file |
+    | `--verbose` | `false` | Show detailed output with checksums, lists, and hints |
+    | `--skip-performance` | `false` | Skip performance checks (view analysis) |
+
+    **Example output**
+
+    ```
+    melange doctor - Health Check
+
+    Schema File
+      ✓ Schema file exists at schemas/schema.fga
+      ✓ Schema is valid (3 types, 8 relations)
+      ✓ No cyclic dependencies detected
+
+    Migration State
+      ✓ melange_migrations table exists
+      ✓ Schema migrated (24 functions tracked)
+      ✓ Schema is in sync with database
+
+    Generated Functions
+      ✓ All dispatcher functions present
+      ✓ All 24 expected functions present
+
+    Tuples Source
+      ✓ melange_tuples exists (view)
+      ✓ All required columns present
+
+    Data Health
+      ✓ melange_tuples contains 1523 tuples
+      ✓ All sampled tuples reference valid types and relations
+
+    Performance
+      ✓ View definition parsed (3 branches)
+      ✓ View uses UNION ALL (no unnecessary deduplication)
+      ✓ Source tables: users, organizations, repositories
+      ✓ All ::text cast columns have expression indexes
+
+    Summary: 15 passed, 0 warnings, 0 errors
+    ```
+
+    **What doctor checks**
+
+    | Check group | What it validates |
+    |-------------|-------------------|
+    | **Schema file** | File exists, syntax is valid, no cyclic dependencies |
+    | **Migration state** | `melange_migrations` table exists, schema checksum matches, codegen version is current |
+    | **Generated functions** | All dispatcher and per-relation functions are present, no orphan functions |
+    | **Tuples source** | `melange_tuples` exists with all required columns (`object_type`, `object_id`, `relation`, `subject_type`, `subject_id`) |
+    | **Data health** | Tuple count, sampled tuples reference valid types and relations |
+    | **Performance** | View uses `UNION ALL`, expression indexes exist on `::text`-cast columns |
+
+    Performance checks run automatically when `melange_tuples` is a regular view. They are skipped for tables and materialized views, or when you pass `--skip-performance`.
+
+    **Common issues and fixes**
+
+    | Issue | Fix |
+    |-------|-----|
+    | Schema file not found | Create `schemas/schema.fga` |
+    | Schema has syntax errors | Run `fga model validate` for detailed errors |
+    | Schema out of sync | Run `melange migrate` |
+    | Missing functions | Run `melange migrate` |
+    | Orphan functions | Run `melange migrate` (cleanup is automatic) |
+    | `melange_tuples` missing | Create a view over your domain tables |
+    | Missing columns | Update `melange_tuples` to include all required columns |
+    | Unknown types in tuples | Update the tuples view or schema to match |
+    | `UNION` instead of `UNION ALL` | Replace `UNION` with `UNION ALL` in the view definition |
+    | Missing expression index | Run the `CREATE INDEX` statement shown in the fix hint |
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Client commands
+
+<AccordionGroup>
+  <Accordion title="generate client — generate type-safe client code">
+
+    Generate type-safe client code from your schema.
+
+    ```bash
+    melange generate client \
+      --runtime go \
+      --schema schemas/schema.fga \
+      --output internal/authz \
+      --package authz
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--runtime` | (required) | Target runtime: `go`, `typescript` |
+    | `--schema` | `schemas/schema.fga` | Path to the schema file |
+    | `--output` | stdout | Output directory for generated code |
+    | `--package` | `authz` | Package name for generated code |
+    | `--id-type` | `string` | ID type for constructors: `string`, `int64`, `uuid.UUID` |
+    | `--filter` | `""` | Only generate relations matching this prefix (e.g., `can_`) |
+
+    **Supported runtimes**
+
+    | Runtime | Status | Description |
+    |---------|--------|-------------|
+    | `go` | Implemented | Type-safe constants and constructors |
+    | `typescript` | Planned | TypeScript types and factory functions |
+
+    **Generated code example (Go)**
+
+    ```go
+    // schema_gen.go
+    package authz
+
+    import "github.com/pthm/melange/melange"
+
+    const (
+        TypeUser         melange.ObjectType = "user"
+        TypeOrganization melange.ObjectType = "organization"
+        TypeRepository   melange.ObjectType = "repository"
+    )
+
+    const (
+        RelCanRead   melange.Relation = "can_read"
+        RelCanWrite  melange.Relation = "can_write"
+        RelCanDelete melange.Relation = "can_delete"
+    )
+
+    func User(id int64) melange.Object {
+        return melange.Object{Type: TypeUser, ID: fmt.Sprint(id)}
+    }
+
+    func Repository(id int64) melange.Object {
+        return melange.Object{Type: TypeRepository, ID: fmt.Sprint(id)}
+    }
+
+    func AnyUser() melange.Object {
+        return melange.Object{Type: TypeUser, ID: "*"}
+    }
+    ```
+
+  </Accordion>
+
+  <Accordion title="generate migration — generate versioned SQL migration files">
+
+    Generate timestamped SQL migration files for use with external frameworks such as golang-migrate, Atlas, or Flyway.
+
+    ```bash
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--schema` | `schemas/schema.fga` | Path to the schema file |
+    | `--output` | (stdout) | Output directory for migration files |
+    | `--name` | `melange` | Migration name suffix used in filenames |
+    | `--format` | `split` | Output format: `split` (`.up.sql`/`.down.sql`) or `single` |
+    | `--up` | `false` | Print only the UP migration (stdout mode only) |
+    | `--down` | `false` | Print only the DOWN migration (stdout mode only) |
+    | `--db` | — | Compare against the most recent migration record in this database |
+    | `--git-ref` | — | Compare against the schema at this git ref |
+    | `--previous-schema` | — | Compare against a previous `.fga` file |
+
+    <Info>
+    The three comparison flags (`--db`, `--git-ref`, `--previous-schema`) are mutually exclusive. When none is specified, a full migration containing all functions is generated.
+    </Info>
+
+    **Output modes**
+
+    When `--output` is specified, timestamped files are written to that directory:
+
+    ```
+    db/migrations/20260322143000_melange.up.sql
+    db/migrations/20260322143000_melange.down.sql
+    ```
+
+    When `--output` is omitted, you must specify `--up` or `--down`:
+
+    ```bash
+    melange generate migration --schema schemas/schema.fga --git-ref main --up | psql "$DATABASE_URL"
+    ```
+
+    **Output formats**
+
+    | Format | Files | Use case |
+    |--------|-------|----------|
+    | `split` | `TIMESTAMP_NAME.up.sql`, `TIMESTAMP_NAME.down.sql` | golang-migrate, Atlas, most frameworks |
+    | `single` | `TIMESTAMP_NAME.sql` with UP and DOWN sections | Flyway, single-file frameworks |
+
+    **Comparison modes**
+
+    By default, all generated functions are included. Use a comparison flag to emit only what changed:
+
+    - `--db` — reads the previous function inventory from `melange_migrations`. Most precise, requires database access.
+    - `--git-ref` — compiles the schema at a git ref and compares. No database needed, ideal for CI.
+    - `--previous-schema` — compiles a local file and compares.
+
+    When a comparison is active, only functions with changed SQL bodies are included in UP. Removed functions get `DROP FUNCTION IF EXISTS` statements. Dispatcher functions are always included.
+
+    **Examples**
+
+    ```bash
+    # First migration — all functions
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations
+
+    # Incremental migration comparing against the database
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations \
+      --db postgres://localhost/mydb
+
+    # Incremental migration comparing against git
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations \
+      --git-ref main
+
+    # Preview to stdout
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --git-ref HEAD~1 \
+      --up
+
+    # Single-file format for Flyway
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations \
+      --format single \
+      --git-ref main
+    ```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Utility commands
+
+<AccordionGroup>
+  <Accordion title="init — scaffold a new project">
+
+    Initialize a new Melange project with an interactive wizard.
+
+    ```bash
+    melange init
+    ```
+
+    Melange detects your project type from the current directory and scaffolds a config file, starter schema, and runtime dependency.
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `-y`, `--yes` | `false` | Accept all defaults without prompting |
+    | `--no-install` | `false` | Skip installing runtime dependencies |
+    | `--schema` | `melange/schema.fga` | Schema file path |
+    | `--db` | `postgres://localhost:5432/mydb` | Database URL |
+    | `--template` | `org-rbac` | Starter model: `org-rbac`, `doc-sharing`, `minimal`, `none` |
+    | `--runtime` | (auto-detected) | Client runtime: `go`, `typescript` |
+    | `--output` | `internal/authz` (Go) / `src/authz` (TS) | Client output directory |
+    | `--package` | `authz` | Package name (Go only) |
+    | `--id-type` | `string` | ID type: `string`, `int64`, `uuid.UUID` |
+
+    **Project auto-detection**
+
+    | File | Detected runtime | Default output |
+    |------|-----------------|----------------|
+    | `go.mod` | Go | `internal/authz` |
+    | `package.json` | TypeScript | `src/authz` |
+
+    When a project is detected, client code generation is enabled by default and the runtime dependency is installed automatically (`go get github.com/pthm/melange/melange` for Go, `npm install @pthm/melange` for TypeScript). If both `go.mod` and `package.json` exist, Go takes precedence.
+
+    **Starter templates**
+
+    | Template | Description |
+    |----------|-------------|
+    | `org-rbac` | Organization with role hierarchy and repository permissions (default) |
+    | `doc-sharing` | Google Docs-style owner/editor/viewer model |
+    | `minimal` | Bare-bones model with just `type user` |
+    | `none` | Skip schema file creation |
+
+    **Default directory layout**
+
+    ```
+    myproject/
+    ├── melange/
+    │   ├── config.yaml
+    │   └── schema.fga
+    └── ...
+    ```
+
+    If `--schema` points outside `melange/`, the config is placed at the project root as `melange.yaml`.
+
+    **Examples**
+
+    ```bash
+    # Interactive wizard
+    melange init
+
+    # Accept all defaults (Go project)
+    melange init -y
+
+    # Custom schema and database, skip dependency install
+    melange init -y --schema melange/auth.fga --db postgres://prod:5432/app --no-install
+
+    # Minimal schema with no client generation
+    melange init -y --template minimal
+    ```
+
+  </Accordion>
+
+  <Accordion title="config show — display effective configuration">
+
+    Show the merged configuration after applying defaults, config file, and environment variables.
+
+    ```bash
+    melange config show
+    melange config show --source
+    ```
+
+    **Flags**
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--source` | `false` | Show the config file path being used |
+
+    **Example output**
+
+    ```
+    Config file: /path/to/project/melange.yaml
+
+    schema: schemas/schema.fga
+    database:
+      url: postgres://localhost/mydb
+      host: ""
+      port: 5432
+      ...
+    ```
+
+  </Accordion>
+
+  <Accordion title="version — print version information">
+
+    ```bash
+    melange version
+    ```
+
+    **Output**
+
+    ```
+    melange v1.0.0 (commit: abc1234, built: 2024-01-15)
+    ```
+
+  </Accordion>
+
+  <Accordion title="license — print license and third-party notices">
+
+    ```bash
+    melange license
+    ```
+
+    Displays the Melange license and attribution for all embedded third-party dependencies.
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | General error (validation, runtime, IO) |
+| `2` | Configuration error (invalid config file, missing required settings) |
+| `3` | Schema parse error |
+| `4` | Database connection error |
+
+---
+
+## Common workflows
+
+<AccordionGroup>
+  <Accordion title="Development setup">
+
+    **With `melange init` (recommended)**
+
+    ```bash
+    melange init
+    # Then run commands without flags:
+    melange validate
+    melange migrate
+    melange generate client
+    ```
+
+    **Without a configuration file**
+
+    ```bash
+    # 1. Validate schema syntax
+    melange validate --schema schemas/schema.fga
+
+    # 2. Apply to local database
+    melange migrate \
+      --db postgres://localhost/myapp_dev \
+      --schema schemas/schema.fga
+
+    # 3. Generate Go code
+    melange generate client \
+      --runtime go \
+      --schema schemas/schema.fga \
+      --output internal/authz \
+      --package authz
+    ```
+
+  </Accordion>
+
+  <Accordion title="CI/CD pipeline">
+
+    ```bash
+    export MELANGE_DATABASE_URL="$DATABASE_URL"
+
+    # Fail fast on syntax errors
+    melange validate
+
+    # Preview SQL (optional)
+    melange migrate --dry-run
+
+    # Apply
+    melange migrate
+
+    # Health check
+    melange doctor
+    ```
+
+    To ensure functions are always current after a Melange upgrade:
+
+    ```bash
+    melange migrate --force
+    ```
+
+  </Accordion>
+
+  <Accordion title="Schema updates">
+
+    ```bash
+    # 1. Validate changes
+    melange validate
+
+    # 2. Regenerate client code
+    melange generate client
+
+    # 3. Apply to database
+    melange migrate
+    ```
+
+    Or as a one-liner:
+
+    ```bash
+    melange validate --schema schemas/schema.fga && \
+      melange generate client --runtime go --output internal/authz && \
+      melange migrate --db "$DATABASE_URL"
+    ```
+
+  </Accordion>
+
+  <Accordion title="External migration frameworks">
+
+    Use `generate migration` instead of `migrate` when your team already manages database migrations with golang-migrate, Atlas, Flyway, or a similar tool.
+
+    ```bash
+    # First time — full migration
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations
+
+    # After schema changes — incremental
+    melange generate migration \
+      --schema schemas/schema.fga \
+      --output db/migrations \
+      --git-ref main
+
+    # Commit schema + migration together
+    git add schemas/schema.fga db/migrations/
+    git commit -m "Add editor relation to document type"
+
+    # Apply with your framework
+    migrate -path db/migrations -database "$DATABASE_URL" up
+    ```
+
+  </Accordion>
+
+  <Accordion title="Troubleshooting">
+
+    When permission checks produce unexpected results:
+
+    ```bash
+    # Run all health checks
+    melange doctor
+
+    # Verbose output for more detail
+    melange doctor --verbose
+
+    # Check which configuration is in effect
+    melange config show --source
+    ```
+
+    Common scenarios where `doctor` helps:
+
+    - **Unexpected results** — validates that schema, functions, and tuples are in sync
+    - **After a Melange upgrade** — detects if codegen version has changed and functions need regenerating
+    - **New environment** — validates the full authorization stack is correctly configured
+    - **Slow checks** — detects missing expression indexes and inefficient `UNION` patterns
+
+  </Accordion>
+</AccordionGroup>

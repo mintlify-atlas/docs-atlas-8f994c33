@@ -1,80 +1,343 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Install Melange and run your first permission check in under 5 minutes."
 ---
 
-## Get started in three steps
+<Steps>
 
-Get your documentation site running locally and make your first customization.
+<Step title="Install the CLI">
 
-### Step 1: Set up your local environment
+Choose an installation method for your platform.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<CodeGroup>
 
-### Step 2: Deploy your changes
+```bash Homebrew
+brew install pthm/tap/melange
+```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash Go install
+go install github.com/pthm/melange/cmd/melange@latest
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash Pre-built binary
+# Download from GitHub Releases (macOS binaries are code-signed)
+# https://github.com/pthm/melange/releases
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+</CodeGroup>
 
-### Step 3: Go live
+Verify the installation:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```bash
+melange --help
+```
+
+<Tip>Melange checks for updates automatically. Run `melange --no-update-check <command>` to disable notifications for a single invocation.</Tip>
+
+</Step>
+
+<Step title="Initialize a new project">
+
+Run `melange init` in your project root. The interactive wizard detects your project type, scaffolds a config file and starter schema, and installs the runtime dependency automatically.
+
+<CodeGroup>
+
+```bash Interactive wizard
+melange init
+```
+
+```bash Accept all defaults
+melange init -y
+```
+
+</CodeGroup>
+
+The wizard prompts you for:
+- **Schema path** — where to put your `.fga` model (default: `melange/schema.fga`)
+- **Starter model** — Organization RBAC, Document sharing, Minimal, or None
+- **Database URL** — your PostgreSQL connection string
+- **Client code generation** — optional type-safe client code for Go or TypeScript
+
+When a `go.mod` or `package.json` is found, Melange auto-detects your runtime and pre-fills sensible defaults (`internal/authz` for Go, `src/authz` for TypeScript).
+
+After running `melange init`, your project contains:
+
+```
+myproject/
+├── melange/
+│   ├── config.yaml      # melange configuration
+│   └── schema.fga       # authorization model
+└── ...
+```
+
+<Note>You can also place `melange.yaml` at the project root — Melange discovers both conventions automatically.</Note>
+
+</Step>
+
+<Step title="Define your schema">
+
+Open `melange/schema.fga`. The default `org-rbac` starter template defines an organization role hierarchy and repository permissions inherited from the parent org:
+
+```fga
+model
+  schema 1.1
+
+type user
+
+type organization
+  relations
+    define owner: [user]
+    define admin: [user] or owner
+    define member: [user] or admin
+
+type repository
+  relations
+    define org: [organization]
+    define owner: [user]
+    define admin: [user] or owner
+    define can_read: member from org or admin
+    define can_write: admin
+    define can_delete: owner
+```
+
+This schema defines:
+- **Organizations** with a role hierarchy: `owner` > `admin` > `member`
+- **Repositories** owned by organizations, with `can_read` inherited from the org's `member` relation via `member from org`
+
+Validate the schema at any time:
+
+```bash
+melange validate --schema melange/schema.fga
+```
+
+<Tip>The `can_*` naming convention is useful for filtering relations when generating client code later. Roles like `owner` and `member` handle inheritance; `can_*` relations represent the final permission gates your application checks.</Tip>
+
+</Step>
+
+<Step title="Run melange migrate">
+
+Apply the schema to your PostgreSQL database. Melange compiles your `.fga` schema into optimized PL/pgSQL functions and installs them.
+
+If you used `melange init`, your database URL is already in `melange/config.yaml`:
+
+```bash
+melange migrate
+```
+
+Or pass flags explicitly:
+
+```bash
+melange migrate --db postgres://localhost/mydb --schema melange/schema.fga
+```
+
+To preview the generated SQL without applying it:
+
+```bash
+melange migrate --db postgres://localhost/mydb --dry-run
+```
+
+<Note>If you use an external migration framework such as golang-migrate, Atlas, or Flyway, use `melange generate migration` instead to produce versioned SQL files that fit your existing workflow.</Note>
+
+</Step>
+
+<Step title="Create the melange_tuples view">
+
+Melange reads authorization data from a view called `melange_tuples`. You create this view over your existing domain tables — no separate tuple storage or synchronization is required.
+
+The view must expose five columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `subject_type` | `text` | Type of the subject (e.g., `'user'`) |
+| `subject_id` | `text` | ID of the subject |
+| `relation` | `text` | The relation name (e.g., `'owner'`, `'member'`) |
+| `object_type` | `text` | Type of the object (e.g., `'repository'`) |
+| `object_id` | `text` | ID of the object |
+
+Here is a complete example for the `org-rbac` schema:
+
+```sql
+CREATE OR REPLACE VIEW melange_tuples AS
+
+-- Organization memberships (owner, admin, or member roles)
+SELECT
+    'user'                      AS subject_type,
+    user_id::text               AS subject_id,
+    role                        AS relation,
+    'organization'              AS object_type,
+    organization_id::text       AS object_id
+FROM organization_members
+
+UNION ALL
+
+-- Repository -> Organization relationship (the `org` relation)
+SELECT
+    'organization'              AS subject_type,
+    organization_id::text       AS subject_id,
+    'org'                       AS relation,
+    'repository'                AS object_type,
+    id::text                    AS object_id
+FROM repositories
+
+UNION ALL
+
+-- Direct repository owners
+SELECT
+    'user'                      AS subject_type,
+    user_id::text               AS subject_id,
+    'owner'                     AS relation,
+    'repository'                AS object_type,
+    repository_id::text         AS object_id
+FROM repository_owners;
+```
+
+<Warning>Permission checks will fail until `melange_tuples` exists. If you ran `melange migrate` before creating the view, Melange will have already warned you about this. Create the view as part of your normal schema migrations.</Warning>
+
+</Step>
+
+<Step title="Check permissions">
+
+With the schema applied and `melange_tuples` in place, you can check permissions using the generated SQL functions from any language.
+
+<Tabs>
+  <Tab title="Go runtime">
+
+Install the Go runtime library (zero external dependencies):
+
+```bash
+go get github.com/pthm/melange/melange
+```
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "log"
+
+    "github.com/pthm/melange/melange"
+    _ "github.com/lib/pq"
+)
+
+func main() {
+    ctx := context.Background()
+
+    db, err := sql.Open("postgres", "postgres://localhost/mydb")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    checker := melange.NewChecker(db)
+
+    user := melange.Object{Type: "user", ID: "alice"}
+    repo := melange.Object{Type: "repository", ID: "my-repo"}
+
+    allowed, err := checker.Check(ctx, user, "can_read", repo)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if allowed {
+        log.Println("Access granted")
+    } else {
+        log.Println("Access denied")
+    }
+}
+```
+
+The `Checker` accepts `*sql.DB`, `*sql.Tx`, or `*sql.Conn`, so permission checks can see uncommitted changes within a transaction.
+
+  </Tab>
+  <Tab title="Raw SQL">
+
+`check_permission` is a standard PostgreSQL function — call it from any language or SQL client.
+
+```sql
+-- Returns 1 for allowed, 0 for denied
+SELECT check_permission(
+    'user',       -- subject_type
+    'alice',      -- subject_id
+    'can_read',   -- relation
+    'repository', -- object_type
+    'my-repo'     -- object_id
+);
+
+-- Use in a WHERE clause to filter to accessible rows
+SELECT r.*
+FROM repositories r
+WHERE check_permission('user', 'alice', 'can_read', 'repository', r.id::text) = 1;
+```
+
+Because `check_permission` is an ordinary SQL function, it works from Python, Ruby, TypeScript, or any other language that can execute SQL:
+
+```python
+# Python (psycopg2 / any driver)
+cursor.execute(
+    "SELECT check_permission(%s, %s, %s, %s, %s)",
+    ('user', 'alice', 'can_read', 'repository', 'my-repo')
+)
+allowed = cursor.fetchone()[0] == 1
+```
+
+  </Tab>
+</Tabs>
+
+</Step>
+
+<Step title="Generate type-safe client code (optional)">
+
+Generate constants and constructor helpers so you never mistype a relation name or object type.
+
+```bash
+# Generate Go code
+melange generate client \
+    --runtime go \
+    --schema melange/schema.fga \
+    --output internal/authz \
+    --package authz
+```
+
+Additional flags:
+
+```bash
+# Use int64 IDs instead of strings
+melange generate client --runtime go --schema melange/schema.fga --output internal/authz --id-type int64
+
+# Generate only permission relations (can_*)
+melange generate client --runtime go --schema melange/schema.fga --output internal/authz --filter can_
+```
+
+Use the generated code in your permission checks:
+
+```go
+import "myapp/internal/authz"
+
+checker := melange.NewChecker(db)
+
+allowed, err := checker.Check(ctx,
+    authz.User("alice"),
+    authz.RelCanRead,
+    authz.Repository("my-repo"),
+)
+```
+
+<Tip>If you configured client generation in `melange/config.yaml` during `melange init`, you can regenerate at any time with just `melange generate client` — no flags needed.</Tip>
+
+</Step>
+
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+<Columns cols={3}>
+  <Card title="How it works" icon="gears" href="/concepts/how-it-works">
+    Understand how Melange compiles schemas into specialized SQL functions and what happens at query time.
+  </Card>
+  <Card title="Checking permissions" icon="shield-check" href="/guides/checking-permissions">
+    Full API reference for `Check`, `ListObjects`, `ListSubjects`, and bulk checks.
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/reference/cli">
+    All commands, flags, and configuration options for the Melange CLI.
+  </Card>
+</Columns>

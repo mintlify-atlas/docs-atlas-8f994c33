@@ -1,0 +1,298 @@
+---
+title: "Contributing"
+description: "Run tests, benchmarks, and contribute to the Melange codebase."
+---
+
+Contributions are welcome. Melange is still evolving, and bug reports, feedback, and code improvements are all appreciated.
+
+<AccordionGroup>
+
+  <Accordion title="Prerequisites and setup">
+
+    Before you can build and test Melange, you need the following tools installed:
+
+    | Tool | Purpose | Install |
+    |------|---------|--------|
+    | **Go 1.22+** | Build and test | [go.dev/dl](https://go.dev/dl) |
+    | **Just** | Task runner (`justfile`) | `brew install just` or [casey/just](https://github.com/casey/just) |
+    | **Docker** | Runs a PostgreSQL container for integration tests | [docker.com](https://www.docker.com) |
+    | **golangci-lint** | Go linter (installed via `go tool`) | See below |
+    | **gofumpt** | Strict Go formatter (installed via `go tool`) | See below |
+
+    Once you have Go and Just, install the remaining tooling in one step:
+
+    ```bash
+    just install-tools
+    ```
+
+    This runs `go install tool` and `mise install` to pull in `golangci-lint`, `gofumpt`, and any other toolchain dependencies declared in the project.
+
+    <Tip>
+      Run `just` with no arguments to list all available commands, grouped by category.
+    </Tip>
+
+  </Accordion>
+
+  <Accordion title="Getting the source">
+
+    <Steps>
+      <Step title="Fork the repository">
+        Go to [github.com/pthm/melange](https://github.com/pthm/melange) and click **Fork**.
+      </Step>
+
+      <Step title="Clone your fork">
+        ```bash
+        git clone https://github.com/<your-username>/melange.git
+        cd melange
+        ```
+      </Step>
+
+      <Step title="Add the upstream remote">
+        ```bash
+        git remote add upstream https://github.com/pthm/melange.git
+        ```
+      </Step>
+
+      <Step title="Create a feature branch">
+        ```bash
+        git checkout -b my-feature
+        ```
+
+        Use a short, descriptive branch name (e.g., `fix-wildcard-expansion`, `add-listobjects-cache`).
+      </Step>
+    </Steps>
+
+  </Accordion>
+
+  <Accordion title="Running tests">
+
+    ### General test suite
+
+    Run the full suite (unit + integration tests):
+
+    ```bash
+    just test
+    ```
+
+    Or run each tier individually:
+
+    ```bash
+    # Unit tests only — no database required
+    just test-unit
+
+    # Integration tests — requires Docker
+    just test-integration
+    ```
+
+    To run tests with race detection across all modules:
+
+    ```bash
+    just test-race
+    ```
+
+    ### OpenFGA-specific tests
+
+    Melange ships a dedicated suite that validates OpenFGA compatibility. These tests require Docker.
+
+    ```bash
+    # Full OpenFGA suite
+    just test-openfga
+
+    # Single test by name
+    just test-openfga-name wildcard_direct
+
+    # All tests in a feature category
+    just test-openfga-feature Wildcards
+
+    # Tests matching a regex pattern
+    just test-openfga-pattern "^userset"
+
+    # List all available test names
+    just test-openfga-list
+    ```
+
+    <Note>
+      `just test-openfga-full-check` runs the complete upstream OpenFGA check suite including features Melange does not yet support. Many tests in that run are expected to fail — use `just test-openfga` for the supported subset.
+    </Note>
+
+    ### TypeScript client tests
+
+    ```bash
+    # Unit tests only
+    just test-ts-unit
+
+    # Full TypeScript tests (requires a running database)
+    just test-ts
+
+    # Driver compatibility
+    just test-ts-drivers
+    ```
+
+  </Accordion>
+
+  <Accordion title="Running benchmarks">
+
+    ### General benchmarks
+
+    ```bash
+    # Full benchmark suite
+    just bench
+
+    # Limit to a specific scale
+    just bench SCALE=1K
+
+    # Quick single-scale run (no sub-benchmarks)
+    just bench-quick
+
+    # Save results to a file
+    just bench-save benchmark_results.txt
+    ```
+
+    ### OpenFGA benchmarks
+
+    ```bash
+    # Full OpenFGA benchmark suite
+    just bench-openfga
+
+    # Specific category
+    just bench-openfga-category DirectAssignment
+
+    # Single test by name
+    just bench-openfga-name wildcard_direct
+
+    # Tests matching a pattern
+    just bench-openfga-pattern "^wildcard"
+
+    # Checks-only benchmarks (isolates Check from List operations)
+    just bench-openfga-checks
+
+    # Save OpenFGA results to file
+    just bench-openfga-save openfga_results.txt
+    ```
+
+    <Tip>
+      Before and after a change, run `just bench-openfga-save` with two different output files, then compare with `benchstat` to quantify the performance delta.
+    </Tip>
+
+  </Accordion>
+
+  <Accordion title="Code style and linting">
+
+    Melange uses `golangci-lint` with a checked-in configuration at [`.golangci.yml`](https://github.com/pthm/melange/blob/main/.golangci.yml). The active linters are:
+
+    - `errcheck` — unchecked errors
+    - `govet` — suspicious constructs
+    - `staticcheck` — comprehensive static analysis
+    - `unused` — dead code
+    - `gocritic` — diagnostic, style, and performance hints
+    - `misspell` — spelling (locale: US)
+    - `prealloc` — slice pre-allocation opportunities
+    - `unconvert` — unnecessary type conversions
+    - `unparam` — unused function parameters
+
+    Formatting is enforced with `gofumpt` (a strict superset of `gofmt`).
+
+    Run all linters across every module:
+
+    ```bash
+    just lint
+    ```
+
+    Format all Go code:
+
+    ```bash
+    just fmt
+    ```
+
+    Run fmt, lint, and the full test suite together:
+
+    ```bash
+    just check
+    ```
+
+    <Warning>
+      CI will fail if `just lint` or `just fmt` produce changes. Run both locally before pushing.
+    </Warning>
+
+  </Accordion>
+
+  <Accordion title="Submitting a pull request">
+
+    <Steps>
+      <Step title="Make sure all tests pass">
+        ```bash
+        just test
+        ```
+
+        If your change touches OpenFGA behavior:
+
+        ```bash
+        just test-openfga
+        ```
+      </Step>
+
+      <Step title="Lint and format">
+        ```bash
+        just check
+        ```
+      </Step>
+
+      <Step title="Write or update tests">
+        New functionality should include tests. Bug fixes should include a regression test that fails before the fix and passes after.
+      </Step>
+
+      <Step title="Push and open the PR">
+        Push your branch to your fork and open a pull request against `main`.
+
+        ```bash
+        git push origin my-feature
+        ```
+
+        In the PR description, explain *what* you changed and *why*. For bug fixes, link to the issue or describe the steps to reproduce.
+      </Step>
+    </Steps>
+
+    For larger changes or new features, consider **opening an issue or starting a discussion on Matrix first** so the approach can be aligned before significant work is done.
+
+    <Note>
+      Your code must pass all existing tests and include tests for any new functionality. CI runs `just lint`, `just test`, and `just test-openfga` on every PR.
+    </Note>
+
+  </Accordion>
+
+</AccordionGroup>
+
+---
+
+## Community and support
+
+<CardGroup cols={2}>
+  <Card title="Matrix chat" icon="message-circle" href="https://matrix.to/#/#melange:matrix.org">
+    Join **#melange:matrix.org** for general discussion, design questions, and quick setup help.
+  </Card>
+  <Card title="Issue tracker" icon="circle-alert" href="https://github.com/pthm/melange/issues">
+    Open an issue for bug reports, feature requests, or design discussions.
+  </Card>
+</CardGroup>
+
+### Reporting a bug
+
+When you open a bug report, please include:
+
+- Steps to reproduce the issue
+- Expected behavior vs. actual behavior
+- Relevant error messages or logs
+- Environment details (OS, Go version, PostgreSQL version)
+
+---
+
+## Reference files
+
+<CardGroup cols={2}>
+  <Card title="justfile" icon="terminal" href="https://github.com/pthm/melange/blob/main/justfile">
+    All development tasks: test, lint, benchmark, build, and release commands.
+  </Card>
+  <Card title="AGENTS.md" icon="file-text" href="https://github.com/pthm/melange/blob/main/AGENTS.md">
+    Workflow reference for automated agents: OpenFGA test commands, SQL dump utilities, and the required contribution workflow.
+  </Card>
+</CardGroup>

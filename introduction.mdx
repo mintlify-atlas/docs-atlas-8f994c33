@@ -1,0 +1,94 @@
+---
+title: "Introduction"
+description: "An OpenFGA-to-PostgreSQL authorization compiler. Generate specialized SQL functions from .fga schemas — zero sync, always consistent."
+---
+
+## What is Melange?
+
+Melange is an **authorization compiler**. It takes your authorization model written in the [OpenFGA](https://openfga.dev) DSL and compiles it into specialized PL/pgSQL functions that run directly inside your PostgreSQL database.
+
+Like Protocol Buffers compiles `.proto` files into serialization code, Melange compiles `.fga` files into optimized SQL functions for [Zanzibar](https://research.google/pubs/pub48190/)-style relationship-based access control.
+
+```
+schema.fga  ──melange migrate──►  PostgreSQL functions
+                                  check_permission()
+                                  list_accessible_objects()
+                                  list_accessible_subjects()
+```
+
+## How it's different
+
+Traditional authorization systems require you to sync your application data to a separate service. Melange takes a different approach: **it's a compiler, not a runtime service**.
+
+<CardGroup cols={2}>
+  <Card title="Traditional FGA" icon="server">
+    - Separate authorization service
+    - Network round-trip for every check
+    - Eventual consistency with your data
+    - Generic graph traversal at runtime
+    - Sync tuples to external store
+  </Card>
+  <Card title="Melange" icon="bolt">
+    - Authorization lives in your database
+    - Single SQL query
+    - Transaction-aware, always consistent
+    - Specialized functions per relation
+    - Query your existing tables directly
+  </Card>
+</CardGroup>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Specialized code generation" icon="code">
+    Each relation gets its own optimized check function — not a generic interpreter evaluating your model at runtime.
+  </Card>
+  <Card title="Works with your tables" icon="database">
+    Permissions are derived from a `melange_tuples` view over your existing data. No tuple sync, no separate store.
+  </Card>
+  <Card title="Transaction aware" icon="arrows-rotate">
+    Permission checks see uncommitted changes within the same transaction. No replication lag, ever.
+  </Card>
+  <Card title="Language agnostic" icon="globe">
+    Generated SQL functions are callable from Go, Python, TypeScript, Ruby — any language with a PostgreSQL client.
+  </Card>
+  <Card title="OpenFGA compatible" icon="check">
+    Use the familiar OpenFGA DSL syntax for your authorization models.
+  </Card>
+  <Card title="Optional runtime libraries" icon="package">
+    Type-safe Go and TypeScript clients for a nicer API. Or skip them and use raw SQL.
+  </Card>
+</CardGroup>
+
+## How it works
+
+**Compile time** — when you run `melange migrate`, the compiler:
+
+1. Parses your OpenFGA schema
+2. Analyzes relation patterns (direct, union, exclusion, computed)
+3. Computes transitive closures for role hierarchies
+4. Generates specialized SQL functions for each relation
+5. Installs the functions into PostgreSQL
+
+**Runtime** — permission checks are simple SQL function calls:
+
+- `check_permission()` calls the generated functions
+- Functions query the `melange_tuples` view you define over your domain tables
+- PostgreSQL's query planner optimizes the specialized functions
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Melange, define your first schema, and run permission checks in minutes.
+  </Card>
+  <Card title="How it works" icon="cog" href="/concepts/how-it-works">
+    Understand the compilation model, generated SQL, and query architecture.
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/reference/cli">
+    Complete reference for all CLI commands and flags.
+  </Card>
+  <Card title="Go runtime" icon="arrow-right" href="/reference/go-runtime">
+    Type-safe Go client library for the generated SQL functions.
+  </Card>
+</CardGroup>

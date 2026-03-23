@@ -1,0 +1,548 @@
+---
+title: "SQL API"
+description: "Reference for the generated PostgreSQL functions installed by melange migrate."
+---
+
+When you run `melange migrate`, Melange installs PostgreSQL functions that you can call from any language or framework with a PostgreSQL client. No Go library required.
+
+## Functions overview
+
+| Function | Purpose |
+|----------|---------|
+| `check_permission` | Check if a subject has a relation on an object |
+| `check_permission_bulk` | Check multiple permissions in a single call |
+| `list_accessible_objects` | List objects a subject can access, with pagination |
+| `list_accessible_subjects` | List subjects with access to an object, with pagination |
+
+These dispatcher functions route to per-relation specialized functions generated from your schema (e.g., `check_document_viewer`). You can call the dispatchers for convenience or the specialized functions directly for a small performance gain.
+
+---
+
+## `check_permission`
+
+Checks whether a subject has a specific relation on an object.
+
+```sql
+check_permission(
+    p_subject_type TEXT,
+    p_subject_id   TEXT,
+    p_relation     TEXT,
+    p_object_type  TEXT,
+    p_object_id    TEXT
+) RETURNS INTEGER
+```
+
+### Parameters
+
+<ParamField path="p_subject_type" type="TEXT" required>
+  Type of the subject, e.g. `'user'`, `'team'`.
+</ParamField>
+
+<ParamField path="p_subject_id" type="TEXT" required>
+  ID of the subject.
+</ParamField>
+
+<ParamField path="p_relation" type="TEXT" required>
+  Relation to check, e.g. `'viewer'`, `'can_read'`.
+</ParamField>
+
+<ParamField path="p_object_type" type="TEXT" required>
+  Type of the object, e.g. `'document'`, `'repository'`.
+</ParamField>
+
+<ParamField path="p_object_id" type="TEXT" required>
+  ID of the object.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="INTEGER">
+  `1` — access granted. `0` — access denied.
+</ResponseField>
+
+### Examples
+
+```sql
+-- Check if user 123 can view document 456
+SELECT check_permission('user', '123', 'viewer', 'document', '456');
+
+-- Filter accessible rows
+SELECT d.*
+FROM documents d
+WHERE check_permission('user', '123', 'viewer', 'document', d.id::text) = 1;
+
+-- Compute edit capability per row
+SELECT
+    d.id,
+    d.title,
+    CASE WHEN check_permission('user', '123', 'editor', 'document', d.id::text) = 1
+         THEN true ELSE false END AS can_edit
+FROM documents d
+WHERE check_permission('user', '123', 'viewer', 'document', d.id::text) = 1;
+```
+
+---
+
+## `check_permission_bulk`
+
+Checks multiple permissions in a single SQL call. Each position across the input arrays forms one check request.
+
+```sql
+check_permission_bulk(
+    p_subject_types TEXT[],
+    p_subject_ids   TEXT[],
+    p_relations     TEXT[],
+    p_object_types  TEXT[],
+    p_object_ids    TEXT[]
+) RETURNS TABLE(idx INTEGER, allowed INTEGER)
+```
+
+### Parameters
+
+<ParamField path="p_subject_types" type="TEXT[]" required>
+  Array of subject types, e.g. `ARRAY['user', 'user']`.
+</ParamField>
+
+<ParamField path="p_subject_ids" type="TEXT[]" required>
+  Array of subject IDs, one per check.
+</ParamField>
+
+<ParamField path="p_relations" type="TEXT[]" required>
+  Array of relations to check.
+</ParamField>
+
+<ParamField path="p_object_types" type="TEXT[]" required>
+  Array of object types.
+</ParamField>
+
+<ParamField path="p_object_ids" type="TEXT[]" required>
+  Array of object IDs.
+</ParamField>
+
+<Warning>
+All five arrays must be the same length. Position `n` across all arrays forms a single check request.
+</Warning>
+
+### Return value
+
+<ResponseField name="idx" type="INTEGER">
+  1-based position corresponding to the input arrays.
+</ResponseField>
+
+<ResponseField name="allowed" type="INTEGER">
+  `1` — access granted. `0` — access denied.
+</ResponseField>
+
+One row is returned per input check, in index order.
+
+### Examples
+
+```sql
+-- Check two permissions in one call
+SELECT idx, allowed
+FROM check_permission_bulk(
+    ARRAY['user', 'user'],
+    ARRAY['123', '123'],
+    ARRAY['viewer', 'editor'],
+    ARRAY['document', 'document'],
+    ARRAY['456', '789']
+);
+-- idx | allowed
+-- ----+---------
+--   1 |       1
+--   2 |       0
+
+-- Mixed types and relations
+SELECT idx, allowed
+FROM check_permission_bulk(
+    ARRAY['user',     'user',     'team'],
+    ARRAY['123',      '123',      '456'],
+    ARRAY['viewer',   'can_read', 'member'],
+    ARRAY['document', 'repository', 'organization'],
+    ARRAY['doc-1',    'repo-1',   'org-1']
+);
+```
+
+---
+
+## `list_accessible_objects`
+
+Returns all object IDs that a subject has a specific relation on, with cursor-based pagination.
+
+```sql
+list_accessible_objects(
+    p_subject_type TEXT,
+    p_subject_id   TEXT,
+    p_relation     TEXT,
+    p_object_type  TEXT,
+    p_limit        INT  DEFAULT NULL,
+    p_after        TEXT DEFAULT NULL
+) RETURNS TABLE(object_id TEXT, next_cursor TEXT)
+```
+
+### Parameters
+
+<ParamField path="p_subject_type" type="TEXT" required>
+  Type of the subject.
+</ParamField>
+
+<ParamField path="p_subject_id" type="TEXT" required>
+  ID of the subject.
+</ParamField>
+
+<ParamField path="p_relation" type="TEXT" required>
+  Relation to check.
+</ParamField>
+
+<ParamField path="p_object_type" type="TEXT" required>
+  Type of objects to list.
+</ParamField>
+
+<ParamField path="p_limit" type="INT">
+  Maximum number of results per page. `NULL` returns all results with no limit.
+</ParamField>
+
+<ParamField path="p_after" type="TEXT">
+  Cursor from the previous page. `NULL` starts from the beginning.
+</ParamField>
+
+### Return value
+
+<ResponseField name="object_id" type="TEXT">
+  ID of an accessible object.
+</ResponseField>
+
+<ResponseField name="next_cursor" type="TEXT">
+  Cursor for the next page. `NULL` when there are no more pages. The same cursor value is repeated on every row — use the value from any row (typically the last).
+</ResponseField>
+
+Results are ordered deterministically by `object_id` to ensure stable pagination.
+
+### Examples
+
+```sql
+-- First 100 documents user 123 can view
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, NULL);
+
+-- Next page
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, 'doc-100');
+
+-- All accessible objects (no pagination)
+SELECT object_id
+FROM list_accessible_objects('user', '123', 'viewer', 'document', NULL, NULL);
+
+-- Join with domain table for full records
+SELECT d.*
+FROM documents d
+JOIN list_accessible_objects('user', '123', 'viewer', 'document', NULL, NULL) a
+    ON d.id::text = a.object_id;
+```
+
+---
+
+## `list_accessible_subjects`
+
+Returns all subjects that have a specific relation on an object, with cursor-based pagination.
+
+```sql
+list_accessible_subjects(
+    p_object_type  TEXT,
+    p_object_id    TEXT,
+    p_relation     TEXT,
+    p_subject_type TEXT,
+    p_limit        INT  DEFAULT NULL,
+    p_after        TEXT DEFAULT NULL
+) RETURNS TABLE(subject_id TEXT, next_cursor TEXT)
+```
+
+### Parameters
+
+<ParamField path="p_object_type" type="TEXT" required>
+  Type of the object.
+</ParamField>
+
+<ParamField path="p_object_id" type="TEXT" required>
+  ID of the object.
+</ParamField>
+
+<ParamField path="p_relation" type="TEXT" required>
+  Relation to check.
+</ParamField>
+
+<ParamField path="p_subject_type" type="TEXT" required>
+  Type of subjects to list.
+</ParamField>
+
+<ParamField path="p_limit" type="INT">
+  Maximum number of results per page. `NULL` returns all results.
+</ParamField>
+
+<ParamField path="p_after" type="TEXT">
+  Cursor from the previous page. `NULL` starts from the beginning.
+</ParamField>
+
+### Return value
+
+<ResponseField name="subject_id" type="TEXT">
+  ID of a subject with access. Wildcard subjects (`'*'`) appear first.
+</ResponseField>
+
+<ResponseField name="next_cursor" type="TEXT">
+  Cursor for the next page. `NULL` when there are no more pages.
+</ResponseField>
+
+Results are ordered with wildcard subjects first, then alphabetically by `subject_id`.
+
+### Examples
+
+```sql
+-- First 100 users who can view document 456
+SELECT subject_id, next_cursor
+FROM list_accessible_subjects('document', '456', 'viewer', 'user', 100, NULL);
+
+-- Next page
+SELECT subject_id, next_cursor
+FROM list_accessible_subjects('document', '456', 'viewer', 'user', 100, 'user-100');
+
+-- All subjects with access
+SELECT subject_id
+FROM list_accessible_subjects('document', '456', 'viewer', 'user', NULL, NULL);
+
+-- Join with users table
+SELECT u.*
+FROM users u
+JOIN list_accessible_subjects('document', '456', 'viewer', 'user', NULL, NULL) a
+    ON u.id::text = a.subject_id;
+```
+
+---
+
+## Pagination
+
+Both list functions use cursor-based (keyset) pagination for efficient traversal of large result sets.
+
+**How to paginate:**
+
+1. Call with `p_limit` set and `p_after = NULL`
+2. If any row has a non-`NULL` `next_cursor`, there are more pages
+3. Pass that cursor as `p_after` in the next call
+4. Stop when `next_cursor` is `NULL`
+
+```sql
+-- Page 1
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, NULL);
+-- next_cursor = 'doc-100'
+
+-- Page 2
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, 'doc-100');
+-- next_cursor = 'doc-200'
+
+-- Last page
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, 'doc-900');
+-- next_cursor = NULL
+```
+
+**Transaction consistency:** For consistency across multiple pages, wrap the calls in a transaction:
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, NULL);
+-- Continue paging within the same transaction
+COMMIT;
+```
+
+---
+
+## Dispatcher vs specialized functions
+
+In addition to the dispatcher functions, Melange generates specialized functions for every type/relation pair. These are called internally by the dispatchers but you can call them directly:
+
+| Pattern | Function name |
+|---------|---------------|
+| Check | `check_{type}_{relation}(subject_type, subject_id, object_id, p_visited)` |
+| List objects | `list_{type}_{relation}_objects(subject_type, subject_id, p_limit, p_after)` |
+| List subjects | `list_{type}_{relation}_subjects(object_id, subject_type, p_limit, p_after)` |
+
+For a `document` type with a `viewer` relation:
+
+```sql
+-- Specialized check (bypass dispatcher, slightly faster)
+SELECT check_document_viewer('user', '123', '456', ARRAY[]::TEXT[]);
+
+-- Specialized list objects
+SELECT object_id, next_cursor
+FROM list_document_viewer_objects('user', '123', 100, NULL);
+
+-- Specialized list subjects
+SELECT subject_id, next_cursor
+FROM list_document_viewer_subjects('456', 'user', 100, NULL);
+```
+
+<Info>
+The `p_visited` parameter on specialized check functions is used for cycle detection in recursive patterns. Always pass `ARRAY[]::TEXT[]` when calling directly.
+</Info>
+
+---
+
+## Error handling
+
+### `M2002` — resolution too complex
+
+Raised when permission resolution exceeds 25 levels of depth:
+
+```sql
+RAISE EXCEPTION 'resolution too complex' USING ERRCODE = 'M2002';
+```
+
+This can happen with deeply nested parent relationships, complex userset chains, or cyclic permission structures.
+
+```sql
+DO $$
+BEGIN
+    PERFORM check_permission('user', '123', 'viewer', 'document', '456');
+EXCEPTION
+    WHEN SQLSTATE 'M2002' THEN
+        RAISE NOTICE 'Permission resolution too complex';
+END;
+$$;
+```
+
+### Unknown type or relation
+
+When an unknown object type or relation is queried:
+
+- `check_permission` — returns `0` (denied)
+- `list_accessible_objects` — returns an empty result set
+- `list_accessible_subjects` — returns an empty result set
+
+No error is raised.
+
+### Setup errors
+
+| PostgreSQL error | SQLSTATE | Cause | Fix |
+|-----------------|----------|-------|-----|
+| `undefined_function` | `42883` | `check_permission` or `list_accessible_*` not found | Run `melange migrate` |
+| `undefined_table` | `42P01` | `melange_tuples` view doesn't exist | Create the tuples view over your domain tables |
+
+---
+
+## Calling from other languages
+
+<Tabs>
+  <Tab title="Python">
+
+    ```python
+    import psycopg2
+
+    conn = psycopg2.connect("postgresql://localhost/mydb")
+    cur = conn.cursor()
+
+    # Check permission
+    cur.execute(
+        "SELECT check_permission(%s, %s, %s, %s, %s)",
+        ('user', '123', 'viewer', 'document', '456')
+    )
+    allowed = cur.fetchone()[0] == 1
+
+    # List accessible objects (first page)
+    cur.execute(
+        "SELECT object_id, next_cursor FROM list_accessible_objects(%s, %s, %s, %s, %s, %s)",
+        ('user', '123', 'viewer', 'document', 100, None)
+    )
+    rows = cur.fetchall()
+    accessible_ids = [row[0] for row in rows]
+    next_cursor = rows[-1][1] if rows else None
+    ```
+
+  </Tab>
+  <Tab title="Node.js">
+
+    ```javascript
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString: 'postgresql://localhost/mydb' });
+
+    // Check permission
+    const { rows } = await pool.query(
+      'SELECT check_permission($1, $2, $3, $4, $5)',
+      ['user', '123', 'viewer', 'document', '456']
+    );
+    const allowed = rows[0].check_permission === 1;
+
+    // List accessible objects (first page)
+    const result = await pool.query(
+      'SELECT object_id, next_cursor FROM list_accessible_objects($1, $2, $3, $4, $5, $6)',
+      ['user', '123', 'viewer', 'document', 100, null]
+    );
+    const accessibleIds = result.rows.map(row => row.object_id);
+    const nextCursor = result.rows.at(-1)?.next_cursor ?? null;
+    ```
+
+  </Tab>
+  <Tab title="Ruby">
+
+    ```ruby
+    require 'pg'
+
+    conn = PG.connect(dbname: 'mydb')
+
+    # Check permission
+    result = conn.exec_params(
+      'SELECT check_permission($1, $2, $3, $4, $5)',
+      ['user', '123', 'viewer', 'document', '456']
+    )
+    allowed = result[0]['check_permission'] == '1'
+
+    # List accessible objects (first page)
+    result = conn.exec_params(
+      'SELECT object_id, next_cursor FROM list_accessible_objects($1, $2, $3, $4, $5, $6)',
+      ['user', '123', 'viewer', 'document', 100, nil]
+    )
+    accessible_ids = result.map { |row| row['object_id'] }
+    next_cursor = result.ntuples > 0 ? result[result.ntuples - 1]['next_cursor'] : nil
+    ```
+
+  </Tab>
+  <Tab title="psql">
+
+    ```sql
+    -- Check permission
+    SELECT check_permission('user', '123', 'viewer', 'document', '456');
+
+    -- List accessible objects
+    SELECT object_id
+    FROM list_accessible_objects('user', '123', 'viewer', 'document', NULL, NULL);
+
+    -- List subjects with access
+    SELECT subject_id
+    FROM list_accessible_subjects('document', '456', 'viewer', 'user', NULL, NULL);
+    ```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Performance tips
+
+**Use list functions instead of per-row checks.** Calling `check_permission` in a `WHERE` clause means one SQL call per row:
+
+```sql
+-- Inefficient: N function calls
+SELECT d.* FROM documents d
+WHERE check_permission('user', '123', 'viewer', 'document', d.id::text) = 1;
+
+-- Efficient: 1 function call + JOIN
+SELECT d.* FROM documents d
+JOIN list_accessible_objects('user', '123', 'viewer', 'document', NULL, NULL) a
+    ON d.id::text = a.object_id;
+```
+
+**Use pagination for large result sets.** `list_accessible_objects` and `list_accessible_subjects` use recursive CTEs that walk the full permission graph. Pagination reduces response payload but does not reduce query time — the database traverses the entire graph regardless of `p_limit`.
+
+All functions are marked `STABLE`, so they see a consistent snapshot within a transaction, including uncommitted changes to the `melange_tuples` view.

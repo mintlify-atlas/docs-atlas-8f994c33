@@ -1,0 +1,330 @@
+---
+title: "Checking permissions"
+description: "Use the Go Checker API or raw SQL to validate access in your application."
+---
+
+Melange gives you two ways to check permissions: the Go runtime library and raw SQL. Both call the same generated PostgreSQL functions under the hood.
+
+## Two approaches
+
+<Tabs>
+  <Tab title="Go">
+    The Go runtime library wraps the SQL calls in a type-safe API with caching, decision overrides, and bulk check support.
+
+    ```go
+    import "github.com/pthm/melange/melange"
+
+    checker := melange.NewChecker(db)
+
+    user := melange.Object{Type: "user", ID: "123"}
+    repo := melange.Object{Type: "repository", ID: "456"}
+
+    allowed, err := checker.Check(ctx, user, "can_read", repo)
+    if err != nil {
+        return err
+    }
+    if !allowed {
+        return ErrForbidden
+    }
+    ```
+
+    `NewChecker` accepts `*sql.DB`, `*sql.Tx`, or `*sql.Conn`. Using a `*sql.Tx` lets permission checks see uncommitted rows in the same transaction.
+  </Tab>
+  <Tab title="Python">
+    ```python
+    cursor.execute(
+        "SELECT check_permission(%s, %s, %s, %s, %s)",
+        ('user', '123', 'can_read', 'repository', '456')
+    )
+    row = cursor.fetchone()
+    allowed = row[0] == 1
+    ```
+  </Tab>
+  <Tab title="TypeScript">
+    ```typescript
+    const result = await db.query(
+      "SELECT check_permission($1, $2, $3, $4, $5)",
+      ["user", "123", "can_read", "repository", "456"]
+    );
+    const allowed = result.rows[0].check_permission === 1;
+    ```
+  </Tab>
+  <Tab title="Ruby">
+    ```ruby
+    row = DB.fetch(
+      "SELECT check_permission(?, ?, ?, ?, ?)",
+      'user', '123', 'can_read', 'repository', '456'
+    ).first
+    allowed = row[:check_permission] == 1
+    ```
+  </Tab>
+  <Tab title="SQL">
+    ```sql
+    -- Returns 1 for allowed, 0 for denied
+    SELECT check_permission('user', '123', 'can_read', 'repository', '456');
+
+    -- Use in a WHERE clause to filter accessible records
+    SELECT d.*
+    FROM documents d
+    WHERE check_permission('user', '123', 'viewer', 'document', d.id::text) = 1;
+    ```
+  </Tab>
+</Tabs>
+
+## Creating a checker
+
+Create a `Checker` by passing any database handle to `NewChecker`:
+
+```go
+// Connection pool — typical for application-wide use
+checker := melange.NewChecker(db)
+
+// Transaction — sees uncommitted changes in the same transaction
+tx, _ := db.BeginTx(ctx, nil)
+checker := melange.NewChecker(tx)
+
+// Single connection — useful when you need session-scoped state
+conn, _ := db.Conn(ctx)
+checker := melange.NewChecker(conn)
+```
+
+On the first call per process, `NewChecker` validates the schema by probing the `check_permission` function. Issues are logged as warnings but do not prevent the checker from being created.
+
+## Checking a single permission
+
+### `checker.Check`
+
+```go
+func (c *Checker) Check(
+    ctx context.Context,
+    subject SubjectLike,
+    relation RelationLike,
+    object ObjectLike,
+) (bool, error)
+```
+
+`Check` returns `(true, nil)` when access is granted, `(false, nil)` when denied, and `(false, err)` when the check itself fails (for example, the `melange_tuples` view is missing).
+
+```go
+allowed, err := checker.Check(ctx, user, "can_read", repo)
+if err != nil {
+    // Setup problem — not a permission denial
+    return err
+}
+if !allowed {
+    return ErrForbidden
+}
+```
+
+### `checker.Must`
+
+```go
+func (c *Checker) Must(
+    ctx context.Context,
+    subject SubjectLike,
+    relation RelationLike,
+    object ObjectLike,
+)
+```
+
+`Must` panics if the check returns `false` or an error. Use it in handlers where denial means a programming error, not a user-facing 403:
+
+```go
+// After RequireAuth middleware has already authenticated the user:
+checker.Must(ctx, authz.User(user.ID), authz.RelCanWrite, repo)
+// Only reachable if permission is granted
+```
+
+<Warning>
+  Prefer `Check` for user-facing authorization where you need to return a 403 response. Use `Must` only when unauthorized access indicates a bug in the calling code.
+</Warning>
+
+## Type-safe generated client
+
+Run `melange generate client --runtime go` to generate type-safe constructors and constants:
+
+```go
+import "myapp/internal/authz"
+
+// Generated constructors and relation constants
+allowed, err := checker.Check(
+    ctx,
+    authz.User("123"),
+    authz.RelCanRead,
+    authz.Repository("456"),
+)
+```
+
+You can also implement `SubjectLike` and `ObjectLike` directly on your domain models:
+
+```go
+type User struct {
+    ID   int64
+    Name string
+}
+
+func (u User) FGASubject() melange.Object {
+    return melange.Object{Type: "user", ID: fmt.Sprint(u.ID)}
+}
+
+type Repository struct {
+    ID   int64
+    Name string
+}
+
+func (r Repository) FGAObject() melange.Object {
+    return melange.Object{Type: "repository", ID: fmt.Sprint(r.ID)}
+}
+
+// Now pass domain models directly
+allowed, err := checker.Check(ctx, user, "can_read", repo)
+```
+
+## Decision overrides
+
+Decision overrides bypass the database entirely. They are useful for admin tools, background jobs, and tests.
+
+### Checker-level override
+
+Set the override once when constructing the checker:
+
+```go
+// Always allow — for admin tools or testing authorized paths
+checkerAllow := melange.NewChecker(nil, melange.WithDecision(melange.DecisionAllow))
+
+// Always deny — for testing unauthorized paths without a database
+checkerDeny := melange.NewChecker(nil, melange.WithDecision(melange.DecisionDeny))
+```
+
+### Context-based override
+
+Enable context-based overrides with `WithContextDecision`. The checker only reads context overrides when this option is set — the opt-in prevents accidental bypasses from propagating through middleware:
+
+```go
+// Opt in when creating the checker
+checker := melange.NewChecker(db, melange.WithContextDecision())
+
+// Later, in a middleware or test:
+ctx = melange.WithDecisionContext(ctx, melange.DecisionAllow)
+
+// Check uses the context decision; no database query is performed
+allowed, _ := checker.Check(ctx, user, "can_read", repo)
+```
+
+Decision precedence (when `WithContextDecision` is enabled):
+
+1. Context decision (set via `WithDecisionContext`)
+2. Checker-level decision (set via `WithDecision`)
+3. Database check
+
+## Error handling
+
+A `(false, err)` result means the authorization system itself failed — not that access was denied. Denied access always returns `(false, nil)`.
+
+Melange exposes two sentinel errors for common setup problems:
+
+```go
+allowed, err := checker.Check(ctx, user, "can_read", repo)
+if err != nil {
+    if melange.IsNoTuplesTableErr(err) {
+        // The melange_tuples view does not exist.
+        // Create the view over your domain tables and retry.
+        log.Error("authorization not configured: missing melange_tuples view")
+    } else if melange.IsMissingFunctionErr(err) {
+        // The check_permission function is not installed.
+        // Run 'melange migrate' to generate and install it.
+        log.Error("authorization not configured: run 'melange migrate'")
+    }
+    return err
+}
+```
+
+| Sentinel error | Meaning |
+|---|---|
+| `ErrNoTuplesTable` | `melange_tuples` view or table is missing |
+| `ErrMissingFunction` | `check_permission` or `list_accessible_*` function is not installed |
+
+## Bulk checks
+
+When you need to evaluate many permissions at once, use `NewBulkCheck` to send all checks in a single SQL call instead of issuing N individual queries:
+
+```go
+bulk := checker.NewBulkCheck(ctx)
+
+// Add checks — all execute in one SQL call
+for _, repo := range repos {
+    bulk.Add(user, "can_read", repo)
+}
+
+// Or use AddMany for one subject+relation across multiple objects
+bulk.AddMany(user, "can_read", repoA, repoB, repoC)
+
+results, err := bulk.Execute()
+if err != nil {
+    return err
+}
+
+// Aggregate helpers
+if results.All() {
+    // Every check was allowed
+}
+
+// Iterate allowed results
+for _, r := range results.Allowed() {
+    fmt.Printf("%s:%s is accessible\n", r.Object().Type, r.Object().ID)
+}
+
+// Guard-style: return an error if anything was denied
+if err := results.AllOrError(); err != nil {
+    return err // *BulkCheckDeniedError with subject, relation, object, index, total
+}
+```
+
+Tag checks with caller-supplied IDs to retrieve results by name:
+
+```go
+bulk := checker.NewBulkCheck(ctx)
+bulk.AddWithID("read",  user, "can_read",  repo)
+bulk.AddWithID("write", user, "can_write", repo)
+bulk.AddWithID("admin", user, "admin",     repo)
+
+results, err := bulk.Execute()
+if err != nil {
+    return err
+}
+
+if r := results.GetByID("write"); r != nil && r.IsAllowed() {
+    // User can write
+}
+```
+
+<Note>
+  Duplicate checks within a batch are deduplicated automatically — only unique `(subject, relation, object)` tuples are sent to the database. Results are fanned out to all original positions. A single batch may contain at most 10,000 checks (`MaxBulkCheckSize`).
+</Note>
+
+## Raw SQL reference
+
+The `check_permission` function is installed by `melange migrate` and accepts five positional arguments:
+
+```sql
+check_permission(
+    subject_type text,
+    subject_id   text,
+    relation     text,
+    object_type  text,
+    object_id    text
+) RETURNS int  -- 1 = allowed, 0 = denied
+```
+
+For bulk checks from SQL:
+
+```sql
+SELECT idx, allowed
+FROM check_permission_bulk(
+    ARRAY['user',  'user'],
+    ARRAY['123',   '123'],
+    ARRAY['viewer','editor'],
+    ARRAY['document','document'],
+    ARRAY['456',  '456']
+);
+```

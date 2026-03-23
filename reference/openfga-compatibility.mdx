@@ -1,0 +1,272 @@
+---
+title: "OpenFGA compatibility"
+description: "Supported OpenFGA features, known limitations, and migration guidance."
+---
+
+Melange provides **full OpenFGA Schema 1.1 compatibility** and is tested against the official OpenFGA compatibility test suite. All Schema 1.1 tests pass.
+
+## Feature support
+
+| Feature | Support | Level | Notes |
+|---------|---------|-------|-------|
+| **Direct assignment** `[user]` | ✅ | Full | Subjects explicitly granted via tuples |
+| **Userset references** `[type#relation]` | ✅ | Full | Full runtime evaluation |
+| **Wildcards** `[user:*]` | ✅ | Full | Public access; `subject_id = '*'` in tuples |
+| **Union (OR)** | ✅ | Full | Any rule matches |
+| **Intersection (AND)** | ✅ | Full | All rules must match |
+| **Exclusion (BUT NOT)** | ✅ | Full | Recursive with parent inheritance |
+| **Computed relations** | ✅ | Full | `implied_by` with transitive closure |
+| **Tuple-to-userset (FROM)** | ✅ | Full | Parent inheritance |
+| **Contextual tuples** | ✅ | Full | Temporary tuples passed with check request |
+| **Grouping `()`** | ✅ | Full | Complex nested expressions |
+| **Schema 1.1** | ✅ | Full | Fully supported and tested |
+| **Schema 1.0** | ⚠️ | Untested | Parser potentially works, but untested |
+| **Conditions** | ❌ | None | CEL expressions not supported |
+| **Modular models** | ❌ | None | Multi-file, `module`, `extend type` |
+| **Schema 1.2** | ❌ | None | Conditions and modules |
+
+---
+
+## Supported features
+
+<AccordionGroup>
+  <Accordion title="Direct assignment">
+
+    Subjects can be directly assigned to relations via tuples:
+
+    ```fga
+    type document
+      relations
+        define owner: [user]
+        define editor: [user, team]
+    ```
+
+  </Accordion>
+
+  <Accordion title="Union (OR)">
+
+    Multiple conditions combined with OR:
+
+    ```fga
+    define admin: [user] or owner
+    define reader: [user] or writer or can_read from org
+    ```
+
+  </Accordion>
+
+  <Accordion title="Tuple-to-userset (FROM)">
+
+    Inherit permissions from parent objects:
+
+    ```fga
+    type repository
+      relations
+        define org: [organization]
+        define can_read: can_read from org
+    ```
+
+  </Accordion>
+
+  <Accordion title="Role hierarchy (implied-by)">
+
+    Transitive closure is computed at schema load time, not at runtime:
+
+    ```fga
+    define owner: [user]
+    define admin: [user] or owner    # owner implies admin
+    define member: [user] or admin   # owner and admin imply member
+    ```
+
+  </Accordion>
+
+  <Accordion title="Exclusion (BUT NOT)">
+
+    Deny permission based on another relation:
+
+    ```fga
+    define can_review: can_read from repo but not author
+    ```
+
+  </Accordion>
+
+  <Accordion title="Wildcards">
+
+    Public access using wildcard subjects (`subject_id = '*'` in the tuples view):
+
+    ```fga
+    define public: [user:*]
+    define can_read: public or member
+    ```
+
+  </Accordion>
+
+  <Accordion title="Intersection (AND)">
+
+    Require multiple conditions to all be satisfied:
+
+    ```fga
+    define viewer: editor and can_read from org
+    define can_delete: owner and active
+    ```
+
+  </Accordion>
+
+  <Accordion title="Contextual tuples">
+
+    Pass temporary tuples with a check request without storing them in the database. Useful for hypothetical permission checks or time-limited access:
+
+    ```go
+    allowed, err := checker.CheckWithContextualTuples(ctx, user, "can_read", doc,
+        []melange.ContextualTuple{
+            {Subject: user, Relation: "temp_access", Object: doc},
+        },
+    )
+    ```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Unsupported features
+
+### Conditions (Schema 1.2)
+
+CEL expressions for conditional authorization are not supported:
+
+```fga
+# NOT SUPPORTED
+condition ip_allowed(user_ip: ipaddress) {
+  user_ip.in_cidr("10.0.0.0/8")
+}
+
+define viewer: [user with ip_allowed]
+```
+
+### Modular models (Schema 1.2)
+
+Multi-file schemas with `module` and `extend type` are not supported:
+
+```fga
+# NOT SUPPORTED
+module base
+
+extend type document
+  relations
+    define new_relation: [user]
+```
+
+---
+
+## Differences from the OpenFGA runtime API
+
+| Aspect | Melange | OpenFGA |
+|--------|---------|----------|
+| Deployment | Embedded in PostgreSQL | Separate service |
+| Tuple storage | View over existing application tables | Dedicated tuple store |
+| Transaction visibility | Yes — sees uncommitted changes | No — eventual consistency |
+| Check latency | Single database query (300–600 µs) | Network round-trip (1–5 ms) |
+| Horizontal scaling | PostgreSQL limits | Independent scaling |
+| ListUsers API | `list_accessible_subjects` SQL function | `ListUsers` gRPC/HTTP endpoint |
+| Conditions | Not supported | Supported in Schema 1.2 |
+| Modular models | Not supported | Supported in Schema 1.2 |
+
+---
+
+## Migration path to OpenFGA
+
+If you outgrow Melange's capabilities, you can migrate to the full OpenFGA service.
+
+### When to consider migrating
+
+- You need **conditions** (Schema 1.2) for context-aware authorization with CEL expressions
+- You need **modular models** for large multi-file schemas
+- You need a **dedicated authorization service** for independent horizontal scaling
+- Your **tuple volume** exceeds what PostgreSQL can handle efficiently
+
+### Migration steps
+
+<Steps>
+  <Step title="Verify schema compatibility">
+
+    Your `.fga` schema files are compatible with OpenFGA as long as they use Schema 1.1 features only. No changes to schema files are needed if you stay within supported features.
+
+  </Step>
+
+  <Step title="Export tuples">
+
+    Query your `melange_tuples` view to export all tuples:
+
+    ```sql
+    SELECT subject_type, subject_id, relation, object_type, object_id
+    FROM melange_tuples;
+    ```
+
+  </Step>
+
+  <Step title="Import to OpenFGA">
+
+    Write the exported tuples to your OpenFGA store:
+
+    ```bash
+    fga tuple write --store-id $STORE_ID \
+      user:alice owner repository:123
+    ```
+
+  </Step>
+
+  <Step title="Update application code">
+
+    Replace Melange `Checker` calls with the OpenFGA SDK:
+
+    ```go
+    // Before (Melange)
+    allowed, err := checker.Check(ctx, user, "can_read", repo)
+
+    // After (OpenFGA)
+    resp, err := client.Check(ctx).Body(openfga.CheckRequest{
+        TupleKey: openfga.TupleKey{
+            User:     "user:alice",
+            Relation: "can_read",
+            Object:   "repository:123",
+        },
+    }).Execute()
+    allowed := resp.GetAllowed()
+    ```
+
+  </Step>
+
+  <Step title="Replace tuple sync">
+
+    Replace the `melange_tuples` view with tuple writes to OpenFGA on data changes.
+
+  </Step>
+</Steps>
+
+### What stays the same
+
+- Schema files (`.fga`) are compatible
+- Relation names and semantics
+- Subject/object/relation model
+- Basic permission patterns
+
+---
+
+## Testing compatibility
+
+Melange includes the official OpenFGA test suite to validate Schema 1.1 compliance:
+
+```bash
+# Run the complete OpenFGA compatibility test suite
+just test-openfga
+
+# Run specific feature categories
+just test-openfga-feature DirectAssignment
+just test-openfga-feature ComputedUserset
+just test-openfga-feature TupleToUserset
+just test-openfga-feature Intersection
+just test-openfga-feature Exclusion
+just test-openfga-feature Wildcards
+```
+
+The suite validates behavior against the official OpenFGA specification, ensuring that permission checks return identical results to the OpenFGA server for all supported Schema 1.1 patterns.

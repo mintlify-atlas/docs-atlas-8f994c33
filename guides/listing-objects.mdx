@@ -1,0 +1,306 @@
+---
+title: "Listing objects"
+description: "Find all objects a subject has access to using ListObjects."
+---
+
+`ListObjects` answers the question: **"What can this user access?"** It returns all object IDs of a given type that a subject has a specific relation on, using a single recursive CTE query instead of N individual checks.
+
+## Basic usage
+
+<Tabs>
+  <Tab title="Go">
+    ```go
+    // Find all repositories user 123 can read (first page of 100)
+    repoIDs, cursor, err := checker.ListObjects(
+        ctx,
+        authz.User("123"),
+        authz.RelCanRead,
+        "repository",
+        melange.PageOptions{Limit: 100},
+    )
+    if err != nil {
+        return err
+    }
+    // repoIDs = ["repo-1", "repo-456", "repo-789"]
+    // cursor  = nil when there are no more pages
+    ```
+  </Tab>
+  <Tab title="SQL">
+    ```sql
+    -- Returns object_id and next_cursor columns
+    SELECT object_id, next_cursor
+    FROM list_accessible_objects(
+        'user',       -- subject_type
+        '123',        -- subject_id
+        'can_read',   -- relation
+        'repository', -- object_type
+        100,          -- limit  (NULL = no limit)
+        NULL          -- after  (NULL = first page)
+    );
+    ```
+  </Tab>
+</Tabs>
+
+### Function signature
+
+```go
+func (c *Checker) ListObjects(
+    ctx        context.Context,
+    subject    SubjectLike,
+    relation   RelationLike,
+    objectType ObjectType,
+    page       PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+`PageOptions` controls pagination:
+
+```go
+type PageOptions struct {
+    Limit int     // 0 or negative means no limit
+    After *string // cursor from a previous page; nil starts from the beginning
+}
+```
+
+## Fetching all results
+
+Use `ListObjectsAll` to automatically paginate through every page and collect all IDs:
+
+```go
+func (c *Checker) ListObjectsAll(
+    ctx        context.Context,
+    subject    SubjectLike,
+    relation   RelationLike,
+    objectType ObjectType,
+) ([]string, error)
+```
+
+```go
+allRepoIDs, err := checker.ListObjectsAll(
+    ctx,
+    authz.User("123"),
+    authz.RelCanRead,
+    "repository",
+)
+```
+
+<Warning>
+  `ListObjectsAll` loads every matching ID into memory at once. For large datasets, prefer `ListObjects` with explicit pagination.
+</Warning>
+
+## Pagination
+
+Results are ordered deterministically by `object_id`, giving stable cursors across requests.
+
+```go
+var cursor *string
+for {
+    ids, next, err := checker.ListObjects(
+        ctx,
+        authz.User("123"),
+        authz.RelCanRead,
+        "repository",
+        melange.PageOptions{Limit: 100, After: cursor},
+    )
+    if err != nil {
+        return err
+    }
+
+    for _, id := range ids {
+        fmt.Println("accessible:", id)
+    }
+
+    if next == nil {
+        break // no more pages
+    }
+    cursor = next
+}
+```
+
+In SQL, carry the `next_cursor` value from the last row into the next call:
+
+```sql
+-- First page
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, NULL);
+
+-- Next page — pass the cursor returned above
+SELECT object_id, next_cursor
+FROM list_accessible_objects('user', '123', 'viewer', 'document', 100, 'doc-100');
+```
+
+## Common patterns
+
+### Filter a list of resources
+
+Fetch only the objects a user can access, then look up the full records:
+
+```go
+// Get accessible IDs in one query
+accessibleIDs, err := checker.ListObjectsAll(ctx, user, "can_read", "repository")
+if err != nil {
+    return nil, err
+}
+
+// Build a set for O(1) lookup
+accessSet := make(map[string]bool, len(accessibleIDs))
+for _, id := range accessibleIDs {
+    accessSet[id] = true
+}
+
+// Filter your domain slice
+var visible []Repository
+for _, repo := range allRepos {
+    if accessSet[fmt.Sprint(repo.ID)] {
+        visible = append(visible, repo)
+    }
+}
+```
+
+### Paginated access-controlled list
+
+```go
+func GetAccessibleRepos(
+    ctx      context.Context,
+    user     User,
+    cursor   *string,
+    pageSize int,
+) ([]Repository, *string, error) {
+    ids, nextCursor, err := checker.ListObjects(
+        ctx, user, "can_read", "repository",
+        melange.PageOptions{Limit: pageSize, After: cursor},
+    )
+    if err != nil {
+        return nil, nil, err
+    }
+    if len(ids) == 0 {
+        return []Repository{}, nil, nil
+    }
+    repos, err := db.GetRepositoriesByIDs(ctx, ids)
+    return repos, nextCursor, err
+}
+```
+
+### Join in SQL
+
+For read-heavy queries, join `list_accessible_objects` directly with your domain table:
+
+```sql
+-- Efficient: single query, no N+1
+SELECT d.*
+FROM documents d
+JOIN list_accessible_objects('user', '123', 'viewer', 'document', NULL, NULL) a
+    ON d.id::text = a.object_id;
+```
+
+## WithContextualTuples variant
+
+Pass temporary authorization tuples at call time without modifying the database:
+
+```go
+func (c *Checker) ListObjectsWithContextualTuples(
+    ctx        context.Context,
+    subject    SubjectLike,
+    relation   RelationLike,
+    objectType ObjectType,
+    tuples     []ContextualTuple,
+    page       PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+See [Contextual tuples](/guides/contextual-tuples) for details.
+
+## Decision override behavior
+
+| Decision | Behavior |
+|---|---|
+| `DecisionUnset` | Normal database query |
+| `DecisionDeny` | Returns empty slice immediately — no database query |
+| `DecisionAllow` | Falls through to database query |
+
+`DecisionAllow` cannot enumerate "all" objects in the system, so it performs the normal query. If you need to return everything (for an admin user, for example), query your domain tables directly.
+
+## Caching
+
+`ListObjects` does **not** use the per-tuple permission cache configured with `WithCache`. It returns a list, not a single boolean, so the cache key scheme does not apply.
+
+For repeated list queries, implement application-level caching around `ListObjectsAll`:
+
+```go
+type CachedChecker struct {
+    *melange.Checker
+    listCache *lru.Cache // or any cache implementation
+}
+
+func (c *CachedChecker) ListObjectsAll(
+    ctx        context.Context,
+    subject    melange.SubjectLike,
+    relation   melange.RelationLike,
+    objectType melange.ObjectType,
+) ([]string, error) {
+    key := fmt.Sprintf("list:%s:%s:%s:%s",
+        subject.FGASubject().Type,
+        subject.FGASubject().ID,
+        relation.FGARelation(),
+        objectType,
+    )
+
+    if cached, ok := c.listCache.Get(key); ok {
+        return cached.([]string), nil
+    }
+
+    ids, err := c.Checker.ListObjectsAll(ctx, subject, relation, objectType)
+    if err != nil {
+        return nil, err
+    }
+
+    c.listCache.Add(key, ids)
+    return ids, nil
+}
+```
+
+## Performance
+
+`ListObjects` executes a single recursive CTE that walks the permission graph. This provides a 10–50x improvement over looping over individual `Check` calls (N+1). Performance scales with the **number of accessible results**, not the total tuple count.
+
+| Result count | Typical latency |
+|---|---|
+| < 10 objects | 300–500 µs |
+| 10–100 | 1–10 ms |
+| 100–1 K | 10–50 ms |
+| 1 K–10 K | 30–200 ms |
+| 10 K+ | 200–1 000 ms |
+
+<Tip>
+  Use `Limit` in `PageOptions` to bound result size and keep latency predictable. For very large datasets, consider pre-filtering candidate IDs at the application layer before calling `ListObjects`.
+</Tip>
+
+## Transaction consistency
+
+Cursor-based pagination across multiple calls can observe writes that happen between pages. For a fully consistent snapshot, wrap all pages in a repeatable-read transaction:
+
+```go
+tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+if err != nil {
+    return err
+}
+defer tx.Rollback()
+
+txChecker := melange.NewChecker(tx)
+var cursor *string
+for {
+    ids, next, err := txChecker.ListObjects(
+        ctx, user, "can_read", "document",
+        melange.PageOptions{Limit: 100, After: cursor},
+    )
+    if err != nil {
+        return err
+    }
+    // process ids ...
+    if next == nil {
+        break
+    }
+    cursor = next
+}
+tx.Commit()
+```

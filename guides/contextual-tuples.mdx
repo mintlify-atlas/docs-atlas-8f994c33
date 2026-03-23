@@ -1,0 +1,226 @@
+---
+title: "Contextual tuples"
+description: "Pass temporary authorization tuples at check time without modifying your database."
+---
+
+Contextual tuples let you inject temporary authorization facts into a single check or list call. They are not written to the database, so they only affect the request that provides them.
+
+## When to use contextual tuples
+
+<CardGroup cols={3}>
+  <Card title="Sharing previews" icon="link">
+    Grant read access to a document when the request includes a valid share token, without creating a permanent tuple.
+  </Card>
+  <Card title="Temporary grants" icon="clock">
+    Allow time-limited access (for example, during an active support session) that expires when the request ends.
+  </Card>
+  <Card title="Testing" icon="flask-conical">
+    Simulate authorization scenarios in tests without touching your database schema or tuple data.
+  </Card>
+</CardGroup>
+
+## The `ContextualTuple` type
+
+A contextual tuple is a plain struct with the same shape as a row in `melange_tuples`:
+
+```go
+type ContextualTuple struct {
+    Subject  Object
+    Relation Relation
+    Object   Object
+}
+```
+
+Each `Object` has a `Type` and an `ID`:
+
+```go
+type Object struct {
+    Type ObjectType
+    ID   string
+}
+```
+
+## Checking with contextual tuples
+
+Use `CheckWithContextualTuples` instead of `Check`:
+
+```go
+func (c *Checker) CheckWithContextualTuples(
+    ctx     context.Context,
+    subject SubjectLike,
+    relation RelationLike,
+    object  ObjectLike,
+    tuples  []ContextualTuple,
+) (bool, error)
+```
+
+Example — grant a temporary viewer role for the duration of the request:
+
+```go
+tuples := []melange.ContextualTuple{
+    {
+        Subject:  melange.Object{Type: "user",     ID: "alice"},
+        Relation: "viewer",
+        Object:   melange.Object{Type: "document", ID: "doc-789"},
+    },
+}
+
+allowed, err := checker.CheckWithContextualTuples(
+    ctx,
+    melange.Object{Type: "user",     ID: "alice"},
+    "viewer",
+    melange.Object{Type: "document", ID: "doc-789"},
+    tuples,
+)
+```
+
+<Note>
+  If you pass an empty `tuples` slice, `CheckWithContextualTuples` delegates to the regular `Check` method.
+</Note>
+
+## Listing with contextual tuples
+
+Both list operations have a contextual-tuples variant:
+
+```go
+func (c *Checker) ListObjectsWithContextualTuples(
+    ctx        context.Context,
+    subject    SubjectLike,
+    relation   RelationLike,
+    objectType ObjectType,
+    tuples     []ContextualTuple,
+    page       PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+```go
+func (c *Checker) ListSubjectsWithContextualTuples(
+    ctx         context.Context,
+    object      ObjectLike,
+    relation    RelationLike,
+    subjectType ObjectType,
+    tuples      []ContextualTuple,
+    page        PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+Example — list documents a user can read, including one granted via a share link:
+
+```go
+tuples := []melange.ContextualTuple{
+    {
+        Subject:  melange.Object{Type: "user",     ID: "alice"},
+        Relation: "viewer",
+        Object:   melange.Object{Type: "document", ID: "shared-doc"},
+    },
+}
+
+docIDs, cursor, err := checker.ListObjectsWithContextualTuples(
+    ctx,
+    melange.Object{Type: "user", ID: "alice"},
+    "viewer",
+    "document",
+    tuples,
+    melange.PageOptions{Limit: 50},
+)
+```
+
+## Userset subjects
+
+Contextual tuples support userset subjects — groups identified by `type:id#relation` syntax. This lets you temporarily add a user to a group for the duration of the check:
+
+```go
+// Temporarily make alice a member of group:eng
+tuples := []melange.ContextualTuple{
+    {
+        Subject:  melange.Object{Type: "user",  ID: "alice"},
+        Relation: "member",
+        Object:   melange.Object{Type: "group", ID: "eng"},
+    },
+}
+```
+
+If you pass a userset subject with a malformed ID (the `#` separator present but the relation part empty), validation returns `ErrInvalidContextualTuple`.
+
+## How contextual tuples work
+
+When you call any `*WithContextualTuples` method, Melange:
+
+<Steps>
+  <Step title="Validates the tuples">
+    Each tuple is checked for structural correctness (non-empty types, well-formed userset IDs). Invalid tuples return `ErrInvalidContextualTuple` before any SQL is executed.
+  </Step>
+  <Step title="Acquires a pinned connection">
+    Contextual tuples require a stable session so temp objects are visible to subsequent queries. Melange pins the check to a single connection (`*sql.Conn`) obtained from the pool, or reuses the existing `*sql.Tx` or `*sql.Conn`.
+  </Step>
+  <Step title="Creates a session-scoped temp table">
+    ```sql
+    CREATE TEMP TABLE melange_contextual_tuples (
+        subject_type TEXT NOT NULL,
+        subject_id   TEXT NOT NULL,
+        relation     TEXT NOT NULL,
+        object_type  TEXT NOT NULL,
+        object_id    TEXT NOT NULL
+    )
+    ```
+    The table is session-scoped (not `ON COMMIT DROP`) so it survives transaction commits within the session.
+  </Step>
+  <Step title="Inserts the contextual tuples">
+    One `INSERT` per tuple populates the temp table.
+  </Step>
+  <Step title="Creates a shadowing temp view">
+    ```sql
+    CREATE TEMP VIEW melange_tuples AS
+    SELECT subject_type, subject_id, relation, object_type, object_id
+    FROM public.melange_tuples          -- your permanent view
+    UNION ALL
+    SELECT subject_type, subject_id, relation, object_type, object_id
+    FROM melange_contextual_tuples;     -- injected for this request
+    ```
+    The temp view shadows the permanent `melange_tuples` view. All generated permission functions continue to query `melange_tuples` — they automatically see the union of both sources.
+  </Step>
+  <Step title="Runs the permission check">
+    The check or list query executes against the temp view.
+  </Step>
+  <Step title="Cleans up">
+    The temp view and temp table are dropped at the end of the call. If cleanup fails, PostgreSQL reclaims session-scoped temp objects when the connection is returned to the pool.
+  </Step>
+</Steps>
+
+## Bulk checks with contextual tuples
+
+You can also attach contextual tuples to a bulk check:
+
+```go
+tuples := []melange.ContextualTuple{
+    {
+        Subject:  melange.Object{Type: "user",     ID: "alice"},
+        Relation: "viewer",
+        Object:   melange.Object{Type: "document", ID: "shared-doc"},
+    },
+}
+
+results, err := checker.NewBulkCheck(ctx).
+    Add(
+        melange.Object{Type: "user", ID: "alice"},
+        "viewer",
+        melange.Object{Type: "document", ID: "shared-doc"},
+    ).
+    WithContextualTuples(tuples...).
+    Execute()
+```
+
+## Decision overrides and contextual tuples
+
+Decision overrides take precedence over contextual tuples. If a `DecisionDeny` or `DecisionAllow` override is active, the contextual tuples are never evaluated and the database is not queried.
+
+## Validation
+
+Melange validates each contextual tuple before executing any SQL:
+
+| Condition | Error |
+|---|---|
+| Userset ID contains `#` but no relation after it | `ErrInvalidContextualTuple` |
+| Querier is not `*sql.DB`, `*sql.Tx`, or `*sql.Conn` | `ErrContextualTuplesUnsupported` |
+
+Contextual tuples are **not** persisted to `melange_tuples`. They only affect the single call that provides them.

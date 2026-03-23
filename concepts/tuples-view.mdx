@@ -1,0 +1,342 @@
+---
+title: "Tuples view"
+description: "Define the melange_tuples view to map your domain tables to authorization tuples."
+---
+
+Melange's generated functions read authorization data from a PostgreSQL view called `melange_tuples`. You create this view over your existing domain tables — no separate tuple storage or synchronization is required.
+
+## What is the `melange_tuples` view?
+
+When you call `check_permission(...)`, the generated function queries `melange_tuples` to find matching authorization tuples. The view is just a SQL view (or materialized view, or table) that you define. Melange never writes to it — it only reads.
+
+This design gives you:
+
+- **Zero tuple sync** — no background job replicating data to a separate store.
+- **Transaction awareness** — permission checks inside a transaction see uncommitted changes from that same transaction.
+- **Real-time consistency** — tuples always reflect the current state of your domain tables.
+- **Full control** — you decide exactly which rows Melange can see.
+
+<Warning>
+If `melange_tuples` does not exist when you run `melange migrate`, the CLI prints a warning. The migration still succeeds, but `check_permission` will error at runtime until you create the view.
+</Warning>
+
+## Required columns
+
+The view must expose exactly these five `text` columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `subject_type` | `text` | Type of the subject — e.g. `'user'`, `'team'` |
+| `subject_id` | `text` | ID of the subject, or `'*'` for a wildcard |
+| `relation` | `text` | Relation name — e.g. `'owner'`, `'member'`, `'org'` |
+| `object_type` | `text` | Type of the object — e.g. `'repository'`, `'document'` |
+| `object_id` | `text` | ID of the object |
+
+### Why `text` columns?
+
+All ID columns must be `text` for two reasons:
+
+1. **Wildcard support** — the `'*'` wildcard cannot be stored in integer or UUID columns.
+2. **ID type flexibility** — your tables may use `BIGINT`, `UUID`, `VARCHAR`, or composite keys. `text` accommodates all of them.
+
+Cast your IDs when building the view:
+
+```sql
+-- Integer IDs
+user_id::text AS subject_id
+
+-- UUIDs (cast to text automatically)
+user_id::text AS subject_id
+
+-- Already text/varchar — no cast needed
+user_id AS subject_id
+```
+
+<Note>
+The `::text` cast prevents PostgreSQL from using your existing integer indexes directly. See [expression indexes](#expression-indexes-for-text-id-conversion) below to restore efficient index usage.
+</Note>
+
+## Creating the view
+
+Use `UNION ALL` to combine multiple source tables into a single view. Each `SELECT` maps one domain table to the tuple format.
+
+```sql
+CREATE OR REPLACE VIEW melange_tuples AS
+
+-- Organization memberships: users have roles on organizations
+SELECT
+    'user'         AS subject_type,
+    user_id::text  AS subject_id,
+    role           AS relation,       -- 'owner', 'admin', 'member'
+    'organization' AS object_type,
+    organization_id::text AS object_id
+FROM organization_members
+
+UNION ALL
+
+-- Repository ownership: organizations own repositories
+SELECT
+    'organization'        AS subject_type,
+    organization_id::text AS subject_id,
+    'org'                 AS relation,   -- linking relation for parent inheritance
+    'repository'          AS object_type,
+    id::text              AS object_id
+FROM repositories
+
+UNION ALL
+
+-- Repository collaborators: users have direct roles on repositories
+SELECT
+    'user'               AS subject_type,
+    user_id::text        AS subject_id,
+    role                 AS relation,    -- 'admin', 'writer', 'reader'
+    'repository'         AS object_type,
+    repository_id::text  AS object_id
+FROM repository_collaborators;
+```
+
+<Tip>
+Always use `UNION ALL`, not `UNION`. `UNION` deduplicates rows with a sort, which is unnecessary overhead — Melange's functions are idempotent when duplicate tuples exist.
+</Tip>
+
+## Wildcard subjects
+
+To grant public access to a resource, use `'*'` as the `subject_id`:
+
+```sql
+-- Public repositories: any user can read
+SELECT
+    'user'       AS subject_type,
+    '*'          AS subject_id,    -- wildcard: matches any user
+    'reader'     AS relation,
+    'repository' AS object_type,
+    id::text     AS object_id
+FROM repositories
+WHERE is_public = true
+```
+
+`check_permission` automatically checks for both the specific `subject_id` and `'*'`, so no changes to the calling code are needed.
+
+## Performance
+
+Because `melange_tuples` is a view, you cannot create indexes on it directly. Instead, create indexes on the **underlying source tables** that match the access patterns the generated functions use.
+
+### Query patterns
+
+The generated functions use three primary access patterns:
+
+```sql
+-- 1. Direct tuple check (most common)
+SELECT 1 FROM melange_tuples
+WHERE object_type = ? AND object_id = ? AND relation IN (?)
+  AND subject_type = ? AND (subject_id = ? OR subject_id = '*')
+
+-- 2. Parent relation lookup (tuple-to-userset)
+SELECT subject_type, subject_id FROM melange_tuples
+WHERE object_type = ? AND object_id = ? AND relation = ?
+
+-- 3. List seed (list operations)
+SELECT object_id FROM melange_tuples
+WHERE subject_type = ? AND subject_id = ? AND relation = ? AND object_type = ?
+```
+
+### Recommended indexes
+
+Create these indexes on each source table:
+
+```sql
+-- organization_members: object-based and subject-based lookups
+CREATE INDEX idx_org_members_org_role_user
+    ON organization_members (organization_id, role, user_id);
+CREATE INDEX idx_org_members_user_role_org
+    ON organization_members (user_id, role, organization_id);
+
+-- repositories: parent relationship lookup
+CREATE INDEX idx_repos_id_org
+    ON repositories (id, organization_id);
+CREATE INDEX idx_repos_org_id
+    ON repositories (organization_id, id);
+
+-- repository_collaborators: object-based and subject-based lookups
+CREATE INDEX idx_repo_collabs_repo_role_user
+    ON repository_collaborators (repository_id, role, user_id);
+CREATE INDEX idx_repo_collabs_user_role_repo
+    ON repository_collaborators (user_id, role, repository_id);
+```
+
+### Expression indexes for text ID conversion
+
+The `::text` cast in your view prevents PostgreSQL from using integer or UUID-based indexes. **Expression indexes** (functional indexes) solve this by indexing the result of the cast directly:
+
+```sql
+-- organization_members: expression indexes for text ID access
+CREATE INDEX idx_org_members_obj_text
+    ON organization_members ((organization_id::text), (user_id::text));
+CREATE INDEX idx_org_members_subj_text
+    ON organization_members ((user_id::text), (organization_id::text));
+
+-- repositories: text ID expression index
+CREATE INDEX idx_repos_id_text
+    ON repositories ((id::text));
+CREATE INDEX idx_repos_obj_text
+    ON repositories ((id::text), (organization_id::text));
+
+-- repository_collaborators: expression indexes
+CREATE INDEX idx_repo_collabs_obj_text
+    ON repository_collaborators ((repository_id::text), (user_id::text));
+CREATE INDEX idx_repo_collabs_subj_text
+    ON repository_collaborators ((user_id::text), (repository_id::text));
+```
+
+The performance difference at scale is significant:
+
+| Scale | Without expression indexes | With expression indexes |
+|-------|---------------------------|-------------------------|
+| 10K tuples | ~1 ms | ~0.3 ms |
+| 100K tuples | ~7 ms | ~0.5 ms |
+| 1M tuples | ~80 ms | ~3 ms |
+
+<Warning>
+Expression indexes are critical at scale. Without them, exclusion patterns (`but not`) and tuple-to-userset patterns (`viewer from parent`) can be 10–15x slower due to sequential scans through the `UNION ALL` view.
+</Warning>
+
+After creating expression indexes, run `ANALYZE` to update the query planner's statistics:
+
+```sql
+ANALYZE organization_members;
+ANALYZE repositories;
+ANALYZE repository_collaborators;
+```
+
+## Scaling strategies
+
+| Scale | Recommended approach |
+|-------|----------------------|
+| < 10K tuples | Regular view + source table indexes |
+| 10K–100K tuples | Regular view + expression indexes + application cache |
+| 100K–1M tuples | Regular view + expression indexes + application cache, or materialized view |
+| > 1M tuples | Dedicated table with trigger sync + application cache |
+
+### Materialized view
+
+A materialized view pre-computes the full result set and allows you to index it directly:
+
+```sql
+CREATE MATERIALIZED VIEW melange_tuples AS
+-- ... same query as your regular view ...
+WITH DATA;
+
+-- Index directly on the materialized view
+CREATE INDEX idx_mt_object
+    ON melange_tuples (object_type, object_id, relation, subject_type, subject_id);
+CREATE INDEX idx_mt_subject
+    ON melange_tuples (subject_type, subject_id, relation, object_type, object_id);
+```
+
+Materialized views must be refreshed manually when your data changes:
+
+<Tabs>
+  <Tab title="Periodic refresh">
+```sql
+-- Via cron or pg_cron — simple but permissions may be briefly stale
+REFRESH MATERIALIZED VIEW CONCURRENTLY melange_tuples;
+```
+  </Tab>
+  <Tab title="On-demand refresh">
+```sql
+-- In your application after bulk updates
+SELECT REFRESH MATERIALIZED VIEW CONCURRENTLY melange_tuples;
+```
+  </Tab>
+  <Tab title="Trigger-based refresh">
+```sql
+CREATE OR REPLACE FUNCTION refresh_tuples_trigger()
+RETURNS TRIGGER AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY melange_tuples;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER refresh_tuples_on_members
+    AFTER INSERT OR UPDATE OR DELETE ON organization_members
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION refresh_tuples_trigger();
+```
+  </Tab>
+</Tabs>
+
+**Trade-offs between a regular view and a materialized view:**
+
+| | Regular view | Materialized view |
+|---|---|---|
+| Query speed | Slower (joins at query time) | Faster (pre-computed) |
+| Data freshness | Always current | Stale until refresh |
+| Transaction visibility | Sees uncommitted changes | Only committed data |
+| Index support | Must index source tables | Direct indexes on view |
+| Maintenance | None | Refresh required |
+
+<Note>
+If you need transaction-aware permission checks — for example, checking permissions on a row you just inserted before committing — use a regular view. Materialized views never see uncommitted data.
+</Note>
+
+## Verifying your view
+
+After creating the view, verify it is working:
+
+```sql
+-- Check the view exists and returns data
+SELECT * FROM melange_tuples LIMIT 10;
+
+-- Test a specific permission
+SELECT check_permission('user', '123', 'can_read', 'repository', '456');
+
+-- Diagnose slow queries
+EXPLAIN ANALYZE
+SELECT 1 FROM melange_tuples
+WHERE object_type = 'repository' AND object_id = '456'
+  AND relation = 'reader' AND subject_type = 'user';
+```
+
+If you see `Seq Scan` with a filter like `Filter: ((id)::text = '456'::text)` in the `EXPLAIN` output, you need an expression index on `(id::text)`.
+
+## Common issues
+
+<AccordionGroup>
+  <Accordion title="'relation melange_tuples does not exist'">
+
+The view has not been created yet. Create it using the patterns on this page, then re-run your permission check.
+
+  </Accordion>
+  <Accordion title="Permissions not updating">
+
+If you are using a **regular view**, check that:
+1. Your domain table changes are committed.
+2. The view query correctly maps your table columns.
+
+If you are using a **materialized view**, refresh it:
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY melange_tuples;
+```
+
+  </Accordion>
+  <Accordion title="Slow permission checks">
+
+1. Run `EXPLAIN ANALYZE` on the underlying query (see above).
+2. Look for `Seq Scan` on source tables — add expression indexes for `::text` cast columns.
+3. Add standard composite indexes on source tables.
+4. Consider a materialized view or dedicated table for read-heavy workloads.
+5. Enable application-level caching.
+
+  </Accordion>
+</AccordionGroup>
+
+<CardGroup cols={2}>
+  <Card title="How it works" icon="gear" href="/concepts/how-it-works">
+    Understand how the compiled functions query the tuples view.
+  </Card>
+  <Card title="Performance" icon="chart-bar" href="/reference/performance">
+    Detailed benchmarks and caching configuration.
+  </Card>
+</CardGroup>

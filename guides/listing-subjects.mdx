@@ -1,0 +1,304 @@
+---
+title: "Listing subjects"
+description: "Find all subjects who have access to a given object using ListSubjects."
+---
+
+`ListSubjects` answers the question: **"Who has access to this resource?"** It is the inverse of `ListObjects` — given a specific object and relation, it returns all subject IDs of a given type that hold that relation.
+
+| Operation | Question answered |
+|---|---|
+| `ListObjects` | What can user X access? |
+| `ListSubjects` | Who has access to object Y? |
+
+## Basic usage
+
+<Tabs>
+  <Tab title="Go">
+    ```go
+    // Find all users who can read repository 456 (first page of 100)
+    userIDs, cursor, err := checker.ListSubjects(
+        ctx,
+        authz.Repository("456"),
+        authz.RelCanRead,
+        "user",
+        melange.PageOptions{Limit: 100},
+    )
+    if err != nil {
+        return err
+    }
+    // userIDs = ["alice", "bob", "carol"]
+    // cursor  = nil when there are no more pages
+    ```
+  </Tab>
+  <Tab title="SQL">
+    ```sql
+    -- Returns subject_id and next_cursor columns
+    SELECT subject_id, next_cursor
+    FROM list_accessible_subjects(
+        'repository', -- object_type
+        '456',        -- object_id
+        'can_read',   -- relation
+        'user',       -- subject_type
+        100,          -- limit  (NULL = no limit)
+        NULL          -- after  (NULL = first page)
+    );
+    ```
+  </Tab>
+</Tabs>
+
+### Function signature
+
+```go
+func (c *Checker) ListSubjects(
+    ctx         context.Context,
+    object      ObjectLike,
+    relation    RelationLike,
+    subjectType ObjectType,
+    page        PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+`PageOptions` controls pagination:
+
+```go
+type PageOptions struct {
+    Limit int     // 0 or negative means no limit
+    After *string // cursor from a previous page; nil starts from the beginning
+}
+```
+
+## Fetching all results
+
+Use `ListSubjectsAll` to automatically paginate through every page and collect all subject IDs:
+
+```go
+func (c *Checker) ListSubjectsAll(
+    ctx         context.Context,
+    object      ObjectLike,
+    relation    RelationLike,
+    subjectType ObjectType,
+) ([]string, error)
+```
+
+```go
+allUserIDs, err := checker.ListSubjectsAll(
+    ctx,
+    authz.Repository("456"),
+    authz.RelCanRead,
+    "user",
+)
+```
+
+<Warning>
+  `ListSubjectsAll` loads every matching ID into memory at once. For large datasets, prefer `ListSubjects` with explicit pagination.
+</Warning>
+
+## Pagination
+
+Results are ordered with wildcard subjects (`*`) first, then alphabetically by `subject_id`. This ordering is stable across pages.
+
+```go
+var cursor *string
+for {
+    ids, next, err := checker.ListSubjects(
+        ctx,
+        authz.Repository("456"),
+        authz.RelCanRead,
+        "user",
+        melange.PageOptions{Limit: 100, After: cursor},
+    )
+    if err != nil {
+        return err
+    }
+
+    for _, id := range ids {
+        fmt.Println("has access:", id)
+    }
+
+    if next == nil {
+        break // no more pages
+    }
+    cursor = next
+}
+```
+
+In SQL, carry the `next_cursor` value from the last row into the next call:
+
+```sql
+-- First page
+SELECT subject_id, next_cursor
+FROM list_accessible_subjects('repository', '456', 'can_read', 'user', 100, NULL);
+
+-- Next page — pass the cursor returned above
+SELECT subject_id, next_cursor
+FROM list_accessible_subjects('repository', '456', 'can_read', 'user', 100, 'user-100');
+```
+
+## Common patterns
+
+### Display an access list
+
+```go
+func GetAccessList(ctx context.Context, repo Repository) ([]AccessEntry, error) {
+    var entries []AccessEntry
+
+    permissions := []string{"owner", "admin", "can_write", "can_read"}
+    for _, perm := range permissions {
+        userIDs, err := checker.ListSubjectsAll(ctx, repo, perm, "user")
+        if err != nil {
+            return nil, err
+        }
+        for _, id := range userIDs {
+            entries = append(entries, AccessEntry{UserID: id, Permission: perm})
+        }
+    }
+
+    return entries, nil
+}
+```
+
+### Check for any access
+
+Use `Limit: 1` to efficiently determine whether at least one subject has access, without loading the full result set:
+
+```go
+func HasAnyViewers(ctx context.Context, doc Document) (bool, error) {
+    viewers, _, err := checker.ListSubjects(
+        ctx, doc, "can_read", "user",
+        melange.PageOptions{Limit: 1},
+    )
+    if err != nil {
+        return false, err
+    }
+    return len(viewers) > 0, nil
+}
+```
+
+### Notify all users with access
+
+```go
+func NotifyCollaborators(ctx context.Context, repo Repository, message string) error {
+    userIDs, err := checker.ListSubjectsAll(ctx, repo, "can_read", "user")
+    if err != nil {
+        return err
+    }
+    for _, id := range userIDs {
+        if err := notifications.Send(ctx, id, message); err != nil {
+            log.Printf("failed to notify %s: %v", id, err)
+        }
+    }
+    return nil
+}
+```
+
+### Join in SQL
+
+```sql
+-- Fetch full user records for everyone who can view document 456
+SELECT u.*
+FROM users u
+JOIN list_accessible_subjects('document', '456', 'viewer', 'user', NULL, NULL) a
+    ON u.id::text = a.subject_id;
+```
+
+## WithContextualTuples variant
+
+Pass temporary authorization tuples at call time without modifying the database:
+
+```go
+func (c *Checker) ListSubjectsWithContextualTuples(
+    ctx         context.Context,
+    object      ObjectLike,
+    relation    RelationLike,
+    subjectType ObjectType,
+    tuples      []ContextualTuple,
+    page        PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+See [Contextual tuples](/guides/contextual-tuples) for details.
+
+## Decision override behavior
+
+| Decision | Behavior |
+|---|---|
+| `DecisionUnset` | Normal database query |
+| `DecisionDeny` | Returns empty slice immediately — no database query |
+| `DecisionAllow` | Falls through to database query |
+
+`DecisionAllow` cannot enumerate all possible subjects, so it always performs the normal query.
+
+## Caching
+
+`ListSubjects` does **not** use the per-tuple permission cache configured with `WithCache`. It returns a list, not a single boolean. Implement application-level caching if you need to cache list results:
+
+```go
+func (c *CachedChecker) ListSubjectsAll(
+    ctx         context.Context,
+    object      melange.ObjectLike,
+    relation    melange.RelationLike,
+    subjectType melange.ObjectType,
+) ([]string, error) {
+    key := fmt.Sprintf("subjects:%s:%s:%s:%s",
+        object.FGAObject().Type,
+        object.FGAObject().ID,
+        relation.FGARelation(),
+        subjectType,
+    )
+
+    if cached, ok := c.cache.Get(key); ok {
+        return cached.([]string), nil
+    }
+
+    ids, err := c.Checker.ListSubjectsAll(ctx, object, relation, subjectType)
+    if err != nil {
+        return nil, err
+    }
+
+    c.cache.Add(key, ids)
+    return ids, nil
+}
+```
+
+## Performance
+
+`ListSubjects` executes a single recursive CTE that walks the permission graph from a specific object, providing a 10–50x improvement over N individual `Check` calls.
+
+| Tuple count | Typical latency |
+|---|---|
+| 1 K tuples | ~708 µs |
+| 10 K tuples | ~6.3 ms |
+| 100 K tuples | ~42 ms |
+| 1 M tuples | ~864 ms |
+
+`ListSubjects` is typically faster than `ListObjects` because it starts from a specific object rather than searching across all objects in the system.
+
+## Transaction consistency
+
+Cursor-based pagination across multiple calls can observe writes that happen between pages. For a fully consistent snapshot, wrap all pages in a repeatable-read transaction:
+
+```go
+tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+if err != nil {
+    return err
+}
+defer tx.Rollback()
+
+txChecker := melange.NewChecker(tx)
+var cursor *string
+for {
+    ids, next, err := txChecker.ListSubjects(
+        ctx, repo, "can_read", "user",
+        melange.PageOptions{Limit: 100, After: cursor},
+    )
+    if err != nil {
+        return err
+    }
+    // process ids ...
+    if next == nil {
+        break
+    }
+    cursor = next
+}
+tx.Commit()
+```

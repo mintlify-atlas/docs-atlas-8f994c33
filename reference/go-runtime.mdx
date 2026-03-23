@@ -1,0 +1,651 @@
+---
+title: "Go runtime"
+description: "Type-safe Go client library for Melange permission checks."
+---
+
+The Go runtime library provides a type-safe API over the generated SQL functions. It handles connection management, caching, decision overrides, and bulk operations.
+
+## Installation
+
+```bash
+go get github.com/pthm/melange/melange
+```
+
+The runtime module (`github.com/pthm/melange/melange`) has zero external dependencies — standard library only.
+
+---
+
+## Core types
+
+### `Object`
+
+Represents a typed resource identifier. Both subjects and objects in FGA are `Object` values.
+
+```go
+type Object struct {
+    Type ObjectType
+    ID   string
+}
+
+// String returns the canonical "type:id" representation.
+func (o Object) String() string
+
+// FGAObject implements ObjectLike.
+func (o Object) FGAObject() Object
+
+// FGASubject implements SubjectLike.
+func (o Object) FGASubject() Object
+```
+
+### `ObjectType`
+
+```go
+type ObjectType string
+```
+
+### `Relation`
+
+```go
+type Relation string
+
+// FGARelation implements RelationLike.
+func (r Relation) FGARelation() Relation
+```
+
+### `ObjectLike` and `SubjectLike`
+
+Interface types that let you use your own domain models in permission checks without importing domain code into the melange package.
+
+```go
+type ObjectLike interface {
+    FGAObject() Object
+}
+
+type SubjectLike interface {
+    FGASubject() Object
+}
+```
+
+Example domain model implementing both:
+
+```go
+type Repository struct { ID int64 }
+
+func (r Repository) FGAObject() melange.Object {
+    return melange.Object{Type: "repository", ID: fmt.Sprint(r.ID)}
+}
+```
+
+### `RelationLike`
+
+```go
+type RelationLike interface {
+    FGARelation() Relation
+}
+```
+
+### `ContextualTuple`
+
+A tuple provided at request time. Not persisted; affects only the current check or list call.
+
+```go
+type ContextualTuple struct {
+    Subject  Object
+    Relation Relation
+    Object   Object
+}
+```
+
+### `PageOptions`
+
+```go
+type PageOptions struct {
+    // Maximum number of results per page.
+    // Zero or negative means no limit (returns all results).
+    Limit int
+
+    // Cursor from the previous page.
+    // nil starts from the beginning.
+    After *string
+}
+```
+
+### `Querier`
+
+The minimal interface satisfied by `*sql.DB`, `*sql.Tx`, and `*sql.Conn`.
+
+```go
+type Querier interface {
+    QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+    QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+```
+
+---
+
+## `NewChecker`
+
+```go
+func NewChecker(q Querier, opts ...Option) *Checker
+```
+
+Creates a `Checker`. The `Querier` can be `*sql.DB`, `*sql.Tx`, or `*sql.Conn`, enabling permission checks to see uncommitted changes within a transaction.
+
+On the first call with a non-nil `Querier`, `NewChecker` validates the schema once per process (checks that `check_permission` exists). Validation issues are logged as warnings but do not prevent `Checker` creation.
+
+```go
+// With a connection pool
+checker := melange.NewChecker(db)
+
+// With a transaction (sees uncommitted changes)
+tx, _ := db.BeginTx(ctx, nil)
+checker := melange.NewChecker(tx)
+
+// With options
+checker := melange.NewChecker(db,
+    melange.WithCache(cache),
+    melange.WithContextDecision(),
+)
+```
+
+### Options
+
+<AccordionGroup>
+  <Accordion title="WithCache">
+
+    ```go
+    func WithCache(c Cache) Option
+    ```
+
+    Enables caching for permission check results. Both allowed and denied results are cached, including errors, to prevent repeated database queries.
+
+    ```go
+    cache := melange.NewCache(melange.WithTTL(time.Minute))
+    checker := melange.NewChecker(db, melange.WithCache(cache))
+    ```
+
+    See [Cache](#cache) for full cache API.
+
+  </Accordion>
+
+  <Accordion title="WithDecision">
+
+    ```go
+    func WithDecision(d Decision) Option
+    ```
+
+    Sets a decision override that bypasses all database checks on this `Checker`. Useful for admin tools and testing.
+
+    ```go
+    // Always allow (admin tool)
+    checker := melange.NewChecker(db, melange.WithDecision(melange.DecisionAllow))
+
+    // Always deny (testing unauthorized paths)
+    checker := melange.NewChecker(db, melange.WithDecision(melange.DecisionDeny))
+    ```
+
+  </Accordion>
+
+  <Accordion title="WithContextDecision">
+
+    ```go
+    func WithContextDecision() Option
+    ```
+
+    Opts the `Checker` into consulting context-based decision overrides. When enabled, `Check` reads `GetDecisionContext(ctx)` before querying the database.
+
+    Decision precedence when enabled:
+    1. Context decision (set via `WithDecisionContext`)
+    2. Checker decision (set via `WithDecision`)
+    3. Database check
+
+    Context decisions are opt-in by design to prevent accidental bypasses from middleware.
+
+    ```go
+    checker := melange.NewChecker(db, melange.WithContextDecision())
+
+    // In middleware or tests:
+    ctx = melange.WithDecisionContext(ctx, melange.DecisionAllow)
+    ok, _ := checker.Check(ctx, user, rel, obj) // returns true without DB query
+    ```
+
+  </Accordion>
+
+  <Accordion title="WithUsersetValidation">
+
+    ```go
+    func WithUsersetValidation() Option
+    ```
+
+    Enables validation of userset subjects like `group:1#member`. When enabled, `Check` returns an error if the userset relation is missing or malformed.
+
+  </Accordion>
+
+  <Accordion title="WithRequestValidation">
+
+    ```go
+    func WithRequestValidation() Option
+    ```
+
+    Enables validation of check requests before SQL execution. When a `Validator` is provided, validates that the object type, relation, and subject type exist in the authorization model.
+
+  </Accordion>
+
+  <Accordion title="WithValidator">
+
+    ```go
+    func WithValidator(v Validator) Option
+    ```
+
+    Supplies a schema-aware validator for request validation. The `Validator` interface:
+
+    ```go
+    type Validator interface {
+        ValidateUsersetSubject(subject Object) error
+        ValidateCheckRequest(subject Object, relation Relation, object Object) error
+        ValidateListUsersRequest(relation Relation, object Object, subjectType ObjectType) error
+        ValidateContextualTuple(tuple ContextualTuple) error
+    }
+    ```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Permission checks
+
+### `Check`
+
+```go
+func (c *Checker) Check(
+    ctx      context.Context,
+    subject  SubjectLike,
+    relation RelationLike,
+    object   ObjectLike,
+) (bool, error)
+```
+
+Returns `true` if `subject` has `relation` on `object`. Evaluates direct tuples, implied relations (role hierarchies), and parent inheritance according to the loaded FGA schema.
+
+```go
+ok, err := checker.Check(ctx, authz.User("123"), authz.RelCanRead, authz.Repository("456"))
+if err != nil {
+    return err
+}
+if !ok {
+    return ErrForbidden
+}
+```
+
+### `Must`
+
+```go
+func (c *Checker) Must(
+    ctx      context.Context,
+    subject  SubjectLike,
+    relation RelationLike,
+    object   ObjectLike,
+)
+```
+
+Panics if the permission check fails or returns an error. Use in handlers where denial indicates a bug in the calling code rather than a user-facing error.
+
+```go
+// Only reachable if authentication middleware has already verified the user.
+checker.Must(ctx, authz.User(user.ID), authz.RelCanWrite, repo)
+// Execution continues only if permission is granted
+```
+
+### `CheckWithContextualTuples`
+
+```go
+func (c *Checker) CheckWithContextualTuples(
+    ctx      context.Context,
+    subject  SubjectLike,
+    relation RelationLike,
+    object   ObjectLike,
+    tuples   []ContextualTuple,
+) (bool, error)
+```
+
+Checks permission using the provided contextual tuples for this call only. Contextual tuples are not persisted and only affect this single invocation.
+
+```go
+allowed, err := checker.CheckWithContextualTuples(ctx, user, "can_read", doc, []melange.ContextualTuple{
+    {Subject: user, Relation: "temp_access", Object: doc},
+})
+```
+
+<Warning>
+Contextual tuples add approximately 2–4 ms overhead per operation due to temporary table setup. Use stored tuples when possible.
+</Warning>
+
+---
+
+## Listing objects and subjects
+
+### `ListObjects`
+
+```go
+func (c *Checker) ListObjects(
+    ctx        context.Context,
+    subject    SubjectLike,
+    relation   RelationLike,
+    objectType ObjectType,
+    page       PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+Returns object IDs of the given type that `subject` has `relation` on. Supports cursor-based pagination.
+
+```go
+// First page
+ids, cursor, err := checker.ListObjects(ctx,
+    authz.User("123"),
+    authz.RelCanRead,
+    authz.TypeRepository,
+    melange.PageOptions{Limit: 50},
+)
+
+// Next page
+ids2, cursor2, err := checker.ListObjects(ctx,
+    authz.User("123"),
+    authz.RelCanRead,
+    authz.TypeRepository,
+    melange.PageOptions{Limit: 50, After: cursor},
+)
+```
+
+<Note>
+`DecisionDeny` returns an empty list. `DecisionAllow` falls through to normal check — Melange cannot enumerate all objects without querying.
+</Note>
+
+### `ListObjectsAll`
+
+```go
+func (c *Checker) ListObjectsAll(
+    ctx        context.Context,
+    subject    SubjectLike,
+    relation   RelationLike,
+    objectType ObjectType,
+) ([]string, error)
+```
+
+Returns all object IDs by automatically paginating through all results (page size 500).
+
+```go
+ids, err := checker.ListObjectsAll(ctx, authz.User("123"), authz.RelCanRead, authz.TypeRepository)
+```
+
+### `ListSubjects`
+
+```go
+func (c *Checker) ListSubjects(
+    ctx         context.Context,
+    object      ObjectLike,
+    relation    RelationLike,
+    subjectType ObjectType,
+    page        PageOptions,
+) (ids []string, nextCursor *string, err error)
+```
+
+The inverse of `ListObjects`. Returns subject IDs of the given type that have `relation` on `object`.
+
+```go
+// Who can read repository 456?
+ids, cursor, err := checker.ListSubjects(ctx,
+    authz.Repository("456"),
+    authz.RelCanRead,
+    authz.TypeUser,
+    melange.PageOptions{Limit: 50},
+)
+```
+
+### `ListSubjectsAll`
+
+```go
+func (c *Checker) ListSubjectsAll(
+    ctx         context.Context,
+    object      ObjectLike,
+    relation    RelationLike,
+    subjectType ObjectType,
+) ([]string, error)
+```
+
+Returns all subject IDs by automatically paginating through all results.
+
+```go
+ids, err := checker.ListSubjectsAll(ctx, authz.Repository("456"), authz.RelCanRead, authz.TypeUser)
+```
+
+---
+
+## Bulk checks
+
+`NewBulkCheck` batches multiple permission checks into a single SQL call via `check_permission_bulk`.
+
+### Building a bulk check
+
+```go
+results, err := checker.NewBulkCheck(ctx).
+    Add(authz.User("123"), authz.RelCanRead, authz.Repository("1")).
+    Add(authz.User("123"), authz.RelCanWrite, authz.Repository("1")).
+    Add(authz.User("123"), authz.RelCanRead, authz.Repository("2")).
+    Execute()
+```
+
+### `BulkCheckBuilder` methods
+
+| Method | Description |
+|--------|-------------|
+| `Add(subject, relation, object)` | Add a check with an auto-generated ID (the zero-based index as a string) |
+| `AddWithID(id, subject, relation, object)` | Add a check with a caller-supplied ID (must be unique within the batch) |
+| `AddMany(subject, relation, objects...)` | Add checks for one subject+relation across multiple objects |
+| `WithContextualTuples(tuples...)` | Attach contextual tuples to the batch |
+| `Execute()` | Run all checks, returns `(*BulkCheckResults, error)` |
+
+`AddWithID` panics if the ID is empty or duplicate.
+
+Maximum batch size is 10,000 checks (`MaxBulkCheckSize = 10000`).
+
+### `BulkCheckResults` methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `Len()` | `int` | Number of results |
+| `Get(index)` | `*BulkCheckResult` | Result by position (panics if out of range) |
+| `GetByID(id)` | `*BulkCheckResult` | Result by ID, or `nil` if not found |
+| `All()` | `bool` | `true` if every check was allowed |
+| `Any()` | `bool` | `true` if at least one check was allowed |
+| `None()` | `bool` | `true` if no check was allowed |
+| `Results()` | `[]*BulkCheckResult` | All results in request order |
+| `Allowed()` | `[]*BulkCheckResult` | Only allowed results |
+| `Denied()` | `[]*BulkCheckResult` | Only denied/errored results |
+| `Errors()` | `[]error` | All non-nil errors from results |
+| `AllOrError()` | `error` | `nil` if all allowed, otherwise `*BulkCheckDeniedError` |
+
+### `BulkCheckResult` methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ID()` | `string` | Caller-supplied or auto-generated ID |
+| `Index()` | `int` | Position in original request order |
+| `Subject()` | `Object` | Subject of this check |
+| `Relation()` | `Relation` | Relation of this check |
+| `Object()` | `Object` | Object of this check |
+| `IsAllowed()` | `bool` | `true` if allowed and no error |
+| `Err()` | `error` | Any error during this individual check |
+
+---
+
+## Caching
+
+### `NewCache`
+
+```go
+func NewCache(opts ...CacheOption) *CacheImpl
+```
+
+Creates an in-memory cache. Safe for concurrent use. Caches both allowed and denied results.
+
+```go
+cache := melange.NewCache(melange.WithTTL(time.Minute))
+checker := melange.NewChecker(db, melange.WithCache(cache))
+```
+
+### Cache options
+
+| Option | Description |
+|--------|-------------|
+| `WithTTL(duration)` | Time-to-live for entries. `0` (default) means entries never expire. |
+
+### `CacheImpl` methods
+
+| Method | Description |
+|--------|-------------|
+| `Get(subject, relation, object)` | Returns `(allowed bool, err error, ok bool)` |
+| `Set(subject, relation, object, allowed, err)` | Store a result |
+| `Size()` | Number of entries |
+| `Clear()` | Remove all entries |
+
+The `Cache` interface lets you substitute your own implementation (e.g., Redis for distributed caching):
+
+```go
+type Cache interface {
+    Get(subject Object, relation Relation, object Object) (allowed bool, err error, ok bool)
+    Set(subject Object, relation Relation, object Object, allowed bool, err error)
+}
+```
+
+---
+
+## Decision overrides
+
+```go
+type Decision int
+
+const (
+    DecisionUnset Decision = iota  // no override, perform normal check
+    DecisionAllow                  // bypass checks, always return true
+    DecisionDeny                   // bypass checks, always return false
+)
+```
+
+### Context-based decisions
+
+```go
+// Set a decision in context
+func WithDecisionContext(ctx context.Context, decision Decision) context.Context
+
+// Read the decision from context
+func GetDecisionContext(ctx context.Context) Decision
+```
+
+Context decisions are only consulted when the `Checker` was created with `WithContextDecision()`. This opt-in design prevents accidental bypasses from middleware.
+
+```go
+// Test helper: allow everything
+ctx = melange.WithDecisionContext(ctx, melange.DecisionAllow)
+// checker must have WithContextDecision() enabled to honour this
+```
+
+---
+
+## Sentinel errors
+
+| Error | Condition | Fix |
+|-------|-----------|-----|
+| `ErrNoTuplesTable` | `melange_tuples` view/table not found | Create the tuples view over your domain tables |
+| `ErrMissingFunction` | `check_permission` or `list_accessible_*` not found | Run `melange migrate` |
+| `ErrInvalidContextualTuple` | A contextual tuple failed validation | Check tuple structure |
+| `ErrContextualTuplesUnsupported` | Contextual tuples used with an unsupported `Querier` type | Use `*sql.DB`, `*sql.Tx`, or `*sql.Conn` |
+| `ErrInvalidSchema` | Schema parsing failed | Check `.fga` file syntax |
+| `ErrCyclicSchema` | Cycle detected in relation graph | Remove the cycle from the schema |
+| `ErrBulkCheckDenied` | `BulkCheckResults.AllOrError()` with denied checks | Handle the `*BulkCheckDeniedError` |
+
+Helper functions:
+
+```go
+melange.IsNoTuplesTableErr(err)     // errors.Is(err, ErrNoTuplesTable)
+melange.IsMissingFunctionErr(err)   // errors.Is(err, ErrMissingFunction)
+melange.IsCyclicSchemaErr(err)      // errors.Is(err, ErrCyclicSchema)
+melange.IsBulkCheckDeniedErr(err)   // errors.Is(err, ErrBulkCheckDenied)
+melange.IsValidationError(err)      // errors.As(err, &ValidationError{})
+```
+
+### `ValidationError`
+
+Returned when permission resolution exceeds the depth limit or another schema-level validation fails:
+
+```go
+type ValidationError struct {
+    Code    int    // OpenFGA error code (e.g., 2002 for resolution too complex)
+    Message string
+}
+```
+
+```go
+if melange.IsValidationError(err) {
+    code := melange.GetValidationErrorCode(err) // returns the integer code
+}
+```
+
+---
+
+## Complete example
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "time"
+
+    _ "github.com/lib/pq"
+    "github.com/pthm/melange/melange"
+)
+
+func main() {
+    db, err := sql.Open("postgres", "postgres://localhost/mydb")
+    if err != nil {
+        panic(err)
+    }
+
+    // Create a shared cache
+    cache := melange.NewCache(melange.WithTTL(30 * time.Second))
+
+    // Create a checker with cache and context decision support
+    checker := melange.NewChecker(db,
+        melange.WithCache(cache),
+        melange.WithContextDecision(),
+    )
+
+    ctx := context.Background()
+    user := melange.Object{Type: "user", ID: "alice"}
+    repo := melange.Object{Type: "repository", ID: "123"}
+
+    // Single check
+    ok, err := checker.Check(ctx, user, melange.Relation("can_read"), repo)
+    fmt.Printf("can_read: %v (err: %v)\n", ok, err)
+
+    // List objects
+    ids, _, err := checker.ListObjects(ctx, user, melange.Relation("can_read"),
+        melange.ObjectType("repository"), melange.PageOptions{Limit: 10})
+    fmt.Printf("accessible repos: %v\n", ids)
+
+    // Bulk check
+    results, err := checker.NewBulkCheck(ctx).
+        AddWithID("read",  user, melange.Relation("can_read"),  repo).
+        AddWithID("write", user, melange.Relation("can_write"), repo).
+        Execute()
+    if err == nil {
+        fmt.Printf("can_read=%v can_write=%v\n",
+            results.GetByID("read").IsAllowed(),
+            results.GetByID("write").IsAllowed(),
+        )
+    }
+}
+```

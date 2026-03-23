@@ -1,0 +1,203 @@
+---
+title: "Caching"
+description: "Cache permission check results to reduce database load."
+---
+
+Melange's built-in cache stores the result of individual `Check` calls in memory. Because `Check` returns a single boolean, results are keyed by `(subject, relation, object)` and reused on subsequent calls within the same `Checker` instance.
+
+## Enabling the cache
+
+Pass a `Cache` to `NewChecker` using the `WithCache` option:
+
+```go
+cache := melange.NewCache(melange.WithTTL(time.Minute))
+checker := melange.NewChecker(db, melange.WithCache(cache))
+
+// First check hits the database
+allowed, _ := checker.Check(ctx, user, "can_read", repo)
+
+// Identical check later in the same request hits the cache
+allowed, _ = checker.Check(ctx, user, "can_read", repo)
+```
+
+## The `Cache` interface
+
+Any type that satisfies the `Cache` interface can be used:
+
+```go
+type Cache interface {
+    // Get retrieves a cached result.
+    // Returns (allowed, err, found). found is false when the entry is missing or expired.
+    Get(subject Object, relation Relation, object Object) (allowed bool, err error, ok bool)
+
+    // Set stores a permission result.
+    Set(subject Object, relation Relation, object Object, allowed bool, err error)
+}
+```
+
+## Built-in in-memory cache
+
+`NewCache` creates a process-local, goroutine-safe cache backed by a `sync.RWMutex`:
+
+```go
+// No expiry — entries live for the lifetime of the cache
+cache := melange.NewCache()
+
+// 1-minute TTL — stale entries are evicted lazily on Get
+cache := melange.NewCache(melange.WithTTL(time.Minute))
+```
+
+Additional methods on `*CacheImpl`:
+
+```go
+size := cache.Size()  // number of entries currently stored
+cache.Clear()         // remove all entries (useful after mass permission changes)
+```
+
+## What gets cached
+
+| Scenario | Cached? |
+|---|---|
+| Allowed (`true, nil`) | Yes |
+| Denied (`false, nil`) | Yes |
+| Error (`false, err`) | No — errors are never stored |
+| `ListObjects` result | No — list results are not cached |
+| `ListSubjects` result | No — list results are not cached |
+
+Both allowed and denied results are cached. Caching denials avoids repeated database queries for consistently-rejected checks (for example, a user probing resources they do not own).
+
+`ListObjects` and `ListSubjects` return slices, not single booleans, so they do not use the cache. See [Listing objects](/guides/listing-objects#caching) and [Listing subjects](/guides/listing-subjects#caching) for patterns to cache list results at the application layer.
+
+## Scoping the cache to a request
+
+The cache is scoped to a single `Checker` instance. Because `Checker` is lightweight, you can create a new one per request with a fresh cache to avoid stale data leaking across requests:
+
+```go
+func authMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Fresh cache per request — no cross-request staleness
+        cache := melange.NewCache()
+        checker := melange.NewChecker(db, melange.WithCache(cache))
+
+        ctx := context.WithValue(r.Context(), checkerKey, checker)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+With a request-scoped cache, repeated `Check` calls within the same HTTP request are served from memory after the first database round-trip.
+
+<Tip>
+  For long-lived processes with large permission sets and near-static data, use a shared cache with a TTL. For dynamic permissions or high-security contexts, prefer a per-request cache with no TTL.
+</Tip>
+
+## Implementing a custom cache
+
+Implement the `Cache` interface to use a distributed store, an LRU cache, or any other backend:
+
+```go
+// SimpleMapCache is a minimal, non-expiring in-memory cache.
+// It is goroutine-safe because all access is protected by a mutex.
+type SimpleMapCache struct {
+    mu    sync.RWMutex
+    items map[string]bool
+}
+
+func (c *SimpleMapCache) Get(
+    subject  melange.Object,
+    relation melange.Relation,
+    object   melange.Object,
+) (bool, error, bool) {
+    key := fmt.Sprintf("%s:%s:%s:%s:%s",
+        subject.Type, subject.ID, relation, object.Type, object.ID)
+
+    c.mu.RLock()
+    v, ok := c.items[key]
+    c.mu.RUnlock()
+
+    return v, nil, ok
+}
+
+func (c *SimpleMapCache) Set(
+    subject  melange.Object,
+    relation melange.Relation,
+    object   melange.Object,
+    allowed  bool,
+    err      error,
+) {
+    if err != nil {
+        return // do not cache errors
+    }
+    key := fmt.Sprintf("%s:%s:%s:%s:%s",
+        subject.Type, subject.ID, relation, object.Type, object.ID)
+
+    c.mu.Lock()
+    c.items[key] = allowed
+    c.mu.Unlock()
+}
+```
+
+<Warning>
+  Your `Cache` implementation must be safe for concurrent use from multiple goroutines. The `Checker` does not serialize access to the cache.
+</Warning>
+
+## Example: Redis-backed cache
+
+For distributed deployments where multiple application instances share permission state, implement `Cache` against Redis:
+
+```go
+type RedisCache struct {
+    client *redis.Client
+    ttl    time.Duration
+}
+
+func (c *RedisCache) Get(
+    subject  melange.Object,
+    relation melange.Relation,
+    object   melange.Object,
+) (bool, error, bool) {
+    key := fmt.Sprintf("perm:%s:%s:%s:%s:%s",
+        subject.Type, subject.ID, relation, object.Type, object.ID)
+
+    val, err := c.client.Get(context.Background(), key).Result()
+    if err == redis.Nil {
+        return false, nil, false // cache miss
+    }
+    if err != nil {
+        return false, nil, false // treat Redis errors as cache misses
+    }
+    return val == "1", nil, true
+}
+
+func (c *RedisCache) Set(
+    subject  melange.Object,
+    relation melange.Relation,
+    object   melange.Object,
+    allowed  bool,
+    err      error,
+) {
+    if err != nil {
+        return // do not cache errors
+    }
+    key := fmt.Sprintf("perm:%s:%s:%s:%s:%s",
+        subject.Type, subject.ID, relation, object.Type, object.ID)
+
+    val := "0"
+    if allowed {
+        val = "1"
+    }
+    // Ignore errors — a failed Set is a cache miss on the next Get
+    _ = c.client.Set(context.Background(), key, val, c.ttl).Err()
+}
+```
+
+Attach it like any other cache:
+
+```go
+redisCache := &RedisCache{client: rdb, ttl: time.Minute}
+checker := melange.NewChecker(db, melange.WithCache(redisCache))
+```
+
+## Cache and decision overrides
+
+If a decision override (`WithDecision` or `WithContextDecision`) is active, the cache is bypassed entirely — the override returns immediately without consulting or updating the cache.

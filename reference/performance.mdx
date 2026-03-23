@@ -1,0 +1,303 @@
+---
+title: "Performance"
+description: "Benchmark results, optimization strategies, and scaling guidance."
+---
+
+Melange achieves sub-millisecond permission checks by compiling authorization logic into specialized PostgreSQL functions at migration time rather than interpreting the model at runtime.
+
+## How single-query checks work
+
+Every `melange migrate` run produces one PL/pgSQL function per relation. Role hierarchies and implied permissions are computed at compile time (transitive closure) and baked into the generated SQL. At runtime, a permission check is a single SQL function call with no schema interpretation overhead.
+
+This means:
+
+- **Check performance is O(1) with respect to dataset size.** 1K tuples vs 1M tuples: same latency.
+- **List performance scales with result count, not total data.** Small result sets are fast at any scale.
+- **No network round-trips.** Authorization runs inside PostgreSQL.
+
+---
+
+## Benchmark results
+
+All benchmarks run on Apple M2 Pro with PostgreSQL 16. Add 30–50% for real-world p95 latencies with network and connection pool overhead.
+
+### Check performance by pattern type
+
+| Pattern | Check | ListObjects | ListUsers |
+|---------|-------|-------------|----------|
+| Direct assignment (`[user]`) | 300–400 µs | 300–500 µs | 300–400 µs |
+| Computed userset (`viewer: owner`) | 300–400 µs | 300–500 µs | 300–400 µs |
+| Union (`[user] or owner`) | 300–400 µs | 300–500 µs | 300–400 µs |
+| Tuple-to-userset (`viewer from parent`) | 400–450 µs | 400–600 µs | 350–450 µs |
+| Exclusion (`writer but not blocked`) | 500–550 µs | 400–600 µs | 400–500 µs |
+| Intersection (`writer and editor`) | 400–600 µs | 500–800 µs | 600–900 µs |
+| Wildcards (`[user:*]`) | 300–400 µs | 300–500 µs | 300–400 µs |
+| Userset references (`[group#member]`) | 400–600 µs | 600–1000 µs | 400–600 µs |
+
+### Complex pattern performance
+
+| Pattern | Check | ListObjects | ListUsers |
+|---------|-------|-------------|----------|
+| TTU + computed userset | 400–600 µs | 500–800 µs | 400–600 µs |
+| TTU + TTU (nested) | 500–800 µs | 600–1000 µs | 500–800 µs |
+| Three-prong relation | 600–1000 µs | 1–2 ms | 800–1200 µs |
+| Nested TTU with intersection | 600–1000 µs | 800–1500 µs | 1–1.5 ms |
+| Nested TTU with exclusion | 500–900 µs | 700–1200 µs | 1–1.5 ms |
+
+### Expensive operations to avoid
+
+| Pattern | Check | ListObjects | ListUsers | Notes |
+|---------|-------|-------------|----------|-------|
+| Recursive TTU unions | 1.3–1.7 ms | 1–2 ms | 1–2 ms | Deep relation traversal |
+| Nested usersets (recursive) | 1–1.5 ms | 1.5–2.5 ms | 2–3 ms | Full graph expansion |
+| Contextual tuples | +2–4 ms | +3–5 ms | +3–5 ms | Temporary table overhead |
+| Wildcard expansion (worst case) | 800–1200 µs | 5–15 ms | 10–30 ms | Full enumeration required |
+
+### Validation performance
+
+Invalid requests are rejected immediately without database queries:
+
+| Validation | Latency |
+|------------|---------|
+| Invalid relation | ~25 ns |
+| Invalid type | ~30 ns |
+| Invalid user format | ~30 ns |
+| Invalid contextual tuple | ~25 ns |
+
+---
+
+## Scale benchmarks
+
+These benchmarks use a GitHub-like authorization model (organizations, repositories, pull requests) across four data scales.
+
+### Check operations scale with O(1)
+
+| Operation | 1K | 10K | 100K | 1M | Scaling |
+|-----------|-----|-----|------|----|---------|
+| Direct membership (`user` → `can_read` → `organization`) | 357 µs | 329 µs | 296 µs | 304 µs | O(1) |
+| Inherited permission (`user` → `can_read` → `repository` via org) | 412 µs | 410 µs | 420 µs | 418 µs | O(1) |
+| Exclusion pattern (`can_review` = reader but not author) | 515 µs | 520 µs | 533 µs | 505 µs | O(1) |
+| Denied permission (non-member, expected: denied) | 275 µs | 277 µs | 291 µs | 281 µs | O(1) |
+
+### List operations scale with result count
+
+The most important finding: **query time is determined by how many results match, not by how many tuples exist in total.**
+
+**ListObjects:**
+
+| Operation | Results | 1K | 10K | 100K | 1M | Scaling |
+|-----------|---------|-----|-----|------|----|---------|
+| Accessible orgs (direct) | ~5 | 299 µs | 300 µs | 316 µs | 278 µs | O(1) |
+| Accessible repos (via org) | ~10–10K | 3.9 ms | 34.1 ms | 133.9 ms | 672 ms | O(results) |
+| Accessible PRs (via repo→org) | ~100–1M | 4.1 ms | 36.8 ms | 153.1 ms | 843 ms | O(results) |
+
+**ListSubjects:**
+
+| Operation | Results | 1K | 10K | 100K | 1M | Scaling |
+|-----------|---------|-----|-----|------|----|---------|
+| Org members (direct) | ~20–200 | 288 µs | 335 µs | 399 µs | 480 µs | O(log n) |
+| Repo writers (direct) | ~1 | 269 µs | 333 µs | 266 µs | 259 µs | O(1) |
+| Repo readers (via org) | ~20–200 | 413 µs | 346 µs | 346 µs | 339 µs | O(1) |
+
+### Page size has minimal impact
+
+The database walks the entire permission graph regardless of `LIMIT`. Smaller pages reduce response payload without adding query overhead:
+
+| Page size | Query time (10K scale, 500 repos) |
+|-----------|-----------------------------------|
+| 10 | 34.1 ms |
+| 50 | 33.4 ms |
+| 100 | 33.9 ms |
+| 500 | 34.4 ms |
+| Full paginate (100/page) | 34.0 ms |
+
+**Recommendation:** use page sizes of 10–100 for interactive APIs.
+
+### Caching
+
+| Scenario | Latency | Speedup |
+|----------|---------|---------|
+| Cold cache (database query) | 422 µs | baseline |
+| Warm cache (memory lookup) | 83 ns | ~5,000× faster |
+
+```go
+cache := melange.NewCache(melange.WithTTL(time.Minute))
+checker := melange.NewChecker(db, melange.WithCache(cache))
+```
+
+### Parallel throughput
+
+| Operation | Per-op time | vs sequential | Throughput gain |
+|-----------|-------------|---------------|-----------------|
+| Parallel direct check (12 workers) | 89 µs | ~330 µs | ~3.7× |
+| Parallel inherited check (12 workers) | 143 µs | ~415 µs | ~2.9× |
+
+---
+
+## Performance comparison
+
+| Approach | Check latency | Consistency | Scaling |
+|----------|--------------|-------------|----------|
+| Melange (in-database) | 300–600 µs | Transactional | O(1) for checks |
+| OpenFGA (external service) | 1–5 ms | Eventual | O(1) for checks |
+| Application-level RBAC | 10–100 µs | Varies | O(roles) |
+| Direct SQL queries | 50–300 µs | Transactional | O(query complexity) |
+
+---
+
+## Optimization strategies
+
+### 1. Design efficient schemas
+
+Schema design has the largest impact on performance.
+
+| Performance tier | Patterns | Typical check latency |
+|-----------------|----------|----------------------|
+| Fast | Direct, computed userset, union, wildcards | 300–400 µs |
+| Medium | TTU, exclusion, userset references | 400–550 µs |
+| Slow | Intersection, nested TTU, complex multi-path | 500–800 µs |
+| Very slow | Deep chains, recursive TTU, contextual tuples | 1–4 ms |
+
+**Minimize intersections** — intersection requires evaluating multiple paths:
+
+```fga
+# Slower: intersection (~600 µs check)
+define viewer: writer and editor
+
+# Faster: union (~350 µs check)
+define viewer: writer or editor
+```
+
+**Prefer shallow hierarchies** — deep parent traversals increase query complexity:
+
+```fga
+# Better: direct assignment with union
+define viewer: [user, team#member]
+
+# Slower: deep parent chain
+define viewer: viewer from folder
+# folder.viewer: viewer from workspace
+```
+
+**Be cautious with wildcards in list operations** — Check with wildcards is fast (~330 µs) but wildcard expansion in ListObjects/ListUsers can be expensive (5–30 ms in worst cases).
+
+### 2. Index your tuples view
+
+Proper indexing of the source tables behind `melange_tuples` is critical. Without expression indexes, PostgreSQL performs sequential scans when converting integer IDs to text.
+
+```sql
+-- Object-based lookups
+CREATE INDEX idx_org_members_lookup
+    ON organization_members (organization_id, role, user_id);
+
+-- Expression indexes for text ID conversion
+CREATE INDEX idx_org_members_text
+    ON organization_members ((organization_id::text), (user_id::text));
+```
+
+`melange doctor` checks for missing expression indexes and provides exact `CREATE INDEX` statements as fix hints:
+
+- **Warning** when a source table has fewer than 10,000 rows (recommended for future scaling)
+- **Failure** when a source table has 10,000+ rows (critical at current scale)
+
+To skip these checks: `melange doctor --skip-performance`.
+
+### 3. Use `UNION ALL`, not `UNION`
+
+Your `melange_tuples` view should use `UNION ALL`. A bare `UNION` adds deduplication overhead that is unnecessary since each source table contributes distinct rows.
+
+```sql
+-- Correct
+CREATE VIEW melange_tuples AS
+    SELECT ... FROM org_members
+    UNION ALL
+    SELECT ... FROM repo_members;
+
+-- Avoid
+CREATE VIEW melange_tuples AS
+    SELECT ... FROM org_members
+    UNION  -- deduplication overhead
+    SELECT ... FROM repo_members;
+```
+
+`melange doctor` detects bare `UNION` and flags it as a warning.
+
+### 4. Avoid runtime contextual tuples
+
+Contextual tuples add ~3–5 ms overhead per operation due to temporary table setup:
+
+```go
+// Slow: +3–5 ms overhead
+checker.CheckWithContextualTuples(ctx, user, "viewer", doc, temporaryPermissions)
+
+// Fast: 300–500 µs
+checker.Check(ctx, user, "viewer", doc)
+```
+
+If you need contextual tuples frequently, batch multiple checks using `NewBulkCheck`.
+
+### 5. Scale strategies by tuple volume
+
+| Scale | Recommended approach |
+|-------|---------------------|
+| < 10K tuples | Regular view + source table indexes |
+| 10K–100K tuples | Regular view + expression indexes + caching |
+| 100K–1M tuples | Regular view + expression indexes + caching, or materialized view |
+| > 1M tuples | Dedicated table with trigger sync + caching |
+
+**Materialized views** eliminate the join overhead of regular views but require manual or scheduled refresh. They are stale until refreshed, so they are inappropriate when permission changes must be immediately visible.
+
+### 6. Use pagination for large result sets
+
+```go
+// Interactive API: small pages for better UX
+objects, cursor, err := checker.ListObjects(ctx, user, "viewer", "document",
+    melange.PageOptions{Limit: 50})
+
+// Batch processing: larger pages to reduce round-trips
+for cursor := (*string)(nil); ; {
+    ids, next, err := checker.ListObjects(ctx, user, "viewer", "document",
+        melange.PageOptions{Limit: 500, After: cursor})
+    // process ids...
+    if next == nil { break }
+    cursor = next
+}
+
+// Full download: ListObjectsAll auto-paginates
+ids, err := checker.ListObjectsAll(ctx, user, "viewer", "document")
+```
+
+Since query time is roughly constant regardless of page size, **smaller pages are better for interactive UX** without any performance penalty.
+
+### 7. Monitor with EXPLAIN ANALYZE
+
+```sql
+EXPLAIN ANALYZE
+SELECT check_permission('user', '123', 'viewer', 'document', '456');
+```
+
+Look for:
+
+- **Sequential scans** — add indexes to eliminate them
+- **High row estimates** — run `ANALYZE` on your tables
+- **Nested loops with high iterations** — consider simplifying the schema
+
+---
+
+## Summary
+
+**Typical expectations:**
+
+- **Check operations:** 300–600 µs, constant time regardless of dataset size
+- **List with small results** (\<10 items): 300–500 µs
+- **List with large results:** scales with result count (100 items ≈ 4–5 ms, 10K items ≈ 34–37 ms)
+- **Cache hits:** ~83 ns (~5,000× faster than database)
+- **Contextual tuples:** +2–4 ms overhead — use sparingly
+- **Validation rejections:** ~25–30 ns — instant, no database hit
+
+**Patterns to avoid on latency-sensitive paths:**
+
+- Deep intersection chains (prefer union)
+- Contextual tuples (prefer stored tuples)
+- Wildcard expansion in ListObjects/ListUsers
+- Deeply nested TTU chains
